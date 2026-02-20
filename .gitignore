@@ -1,0 +1,15 @@
+node_modules/
+dist/
+release/
+*.db
+.env
+.tsbuildinfo
+.tsbuildinfo-main
+.ralph/
+.claude/
+*.log
+ralph-claude-code/
+electron.log
+electron_out.log
+electron_test.log
+nul
