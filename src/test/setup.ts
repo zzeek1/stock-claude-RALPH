@@ -21,3 +21,29 @@ const originalGetComputedStyle = window.getComputedStyle;
 vi.spyOn(window, 'getComputedStyle').mockImplementation((el) => {
   return originalGetComputedStyle(el);
 });
+
+// Mock electronAPI
+(window as any).electronAPI = {
+  shortcut: {
+    onEdit: vi.fn(() => vi.fn()),
+    onNewTrade: vi.fn(() => vi.fn()),
+    onSave: vi.fn(() => vi.fn()),
+    onRefresh: vi.fn(() => vi.fn()),
+    onEscape: vi.fn(() => vi.fn()),
+  },
+  trade: {
+    list: vi.fn().mockResolvedValue([]),
+    create: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+  },
+  settings: {
+    get: vi.fn().mockResolvedValue({}),
+  },
+  stock: {
+    search: vi.fn().mockResolvedValue([]),
+  },
+  accountMgmt: {
+    list: vi.fn().mockResolvedValue([]),
+  }
+};

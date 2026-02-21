@@ -10,6 +10,9 @@ const ACCESS_TOKEN = "m_eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb25nYnJ
 
 // 缓存配置，避免重复创建
 let configInstance: Config | null = null;
+let quoteContextInstance: QuoteContext | null = null;
+const quoteCache = new Map<string, { data: QuoteInfo; timestamp: number }>();
+const CACHE_TTL = 3000; // 3 seconds
 
 function getConfig(): Config {
   if (!configInstance) {
@@ -22,11 +25,23 @@ function getConfig(): Config {
   return configInstance;
 }
 
+async function getQuoteContext(): Promise<QuoteContext> {
+  if (!quoteContextInstance) {
+    const config = getConfig();
+    quoteContextInstance = await QuoteContext.new(config);
+  }
+  return quoteContextInstance;
+}
+
 /**
- * 清理配置缓存
+ * 清理配置缓存和上下文
  */
 export function clearConfigCache(): void {
   configInstance = null;
+  // QuoteContext 并没有显式的 close 方法在类型定义中（通常），如果有的话应该调用
+  // 假设 SDK 管理连接，我们只是释放引用
+  quoteContextInstance = null;
+  quoteCache.clear();
 }
 
 /**
@@ -35,27 +50,58 @@ export function clearConfigCache(): void {
  * @returns 行情数据数组
  */
 export async function getQuotes(symbols: string[]): Promise<QuoteInfo[]> {
-  const config = getConfig();
-  const ctx = await QuoteContext.new(config);
-  
+  const now = Date.now();
+  const result: QuoteInfo[] = [];
+  const symbolsToFetch: string[] = [];
+
+  // Check cache first
+  for (const symbol of symbols) {
+    const cached = quoteCache.get(symbol);
+    if (cached && (now - cached.timestamp < CACHE_TTL)) {
+      result.push(cached.data);
+    } else {
+      symbolsToFetch.push(symbol);
+    }
+  }
+
+  if (symbolsToFetch.length === 0) {
+    return result;
+  }
+
   try {
-    const quotes = await ctx.quote(symbols);
+    const ctx = await getQuoteContext();
+    const quotes = await ctx.quote(symbolsToFetch);
     
-    return quotes.map(q => ({
-      symbol: q.symbol,
-      name: (q as any).name || "",
-      lastDone: q.lastDone?.toString() || "",
-      change: (q as any).change?.toString() || "",
-      changeRate: (q as any).changeRate?.toString() || "",
-      open: q.open?.toString() || "",
-      high: q.high?.toString() || "",
-      low: q.low?.toString() || "",
-      volume: q.volume?.toString() || "",
-      turnover: q.turnover?.toString() || "",
-      timestamp: q.timestamp || new Date(),
-    }));
-  } finally {
-    // 不需要关闭，SDK 内部管理
+    const fetchedQuotes = quotes.map(q => {
+      const info: QuoteInfo = {
+        symbol: q.symbol,
+        name: (q as any).name || "",
+        lastDone: q.lastDone?.toString() || "",
+        change: (q as any).change?.toString() || "",
+        changeRate: (q as any).changeRate?.toString() || "",
+        open: q.open?.toString() || "",
+        high: q.high?.toString() || "",
+        low: q.low?.toString() || "",
+        volume: q.volume?.toString() || "",
+        turnover: q.turnover?.toString() || "",
+        timestamp: q.timestamp || new Date(),
+      };
+      
+      // Update cache
+      quoteCache.set(q.symbol, {
+        data: info,
+        timestamp: now
+      });
+      
+      return info;
+    });
+
+    return [...result, ...fetchedQuotes];
+  } catch (error) {
+    console.error("Failed to fetch quotes:", error);
+    // If fetch fails, try to return stale cache if available, or throw
+    // For now, let's just re-throw
+    throw error;
   }
 }
 

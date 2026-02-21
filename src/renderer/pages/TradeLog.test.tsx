@@ -43,6 +43,13 @@ vi.mock('../../utils/electron', () => ({
 // Mock window.electronAPI
 Object.defineProperty(window, 'electronAPI', {
   value: {
+    shortcut: {
+      onEdit: vi.fn(() => vi.fn()),
+      onNewTrade: vi.fn(() => vi.fn()),
+      onSave: vi.fn(() => vi.fn()),
+      onRefresh: vi.fn(() => vi.fn()),
+      onEscape: vi.fn(() => vi.fn()),
+    },
     trade: {
       list: vi.fn().mockResolvedValue({
         success: true,

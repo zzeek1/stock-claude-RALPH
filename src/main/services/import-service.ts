@@ -76,6 +76,11 @@ const DEFAULT_FIELD_MAPPING: FieldMapping = {
 };
 
 export function parseCSV(content: string): any[] {
+  // Check for IBKR format
+  if (content.includes('Statement,Header') || content.includes('Statement,Data')) {
+    return parseIBKR(content);
+  }
+
   const lines = content.split(/\r?\n/).filter(line => line.trim());
   if (lines.length === 0) return [];
 
@@ -93,6 +98,123 @@ export function parseCSV(content: string): any[] {
   }
 
   return results;
+}
+
+function parseIBKR(content: string): any[] {
+  const lines = content.split(/\r?\n/);
+  const trades: any[] = [];
+  
+  // Find the Trades header line
+  // Support both English and Chinese headers
+  // English: Trades,Header,DataDiscriminator...
+  // Chinese: 交易,Header,DataDiscriminator...
+  let headerLineIndex = -1;
+  let headerLine = '';
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if ((line.startsWith('Trades,Header') || line.startsWith('交易,Header')) && 
+        line.includes('DataDiscriminator')) {
+      headerLineIndex = i;
+      headerLine = line;
+      break;
+    }
+  }
+
+  if (headerLineIndex === -1) return [];
+
+  const headers = parseCSVLine(headerLine, ',');
+  const headerMap = new Map<string, number>();
+  headers.forEach((h, i) => {
+    const headerName = h.trim();
+    // Only map the first occurrence of a header name
+    // This handles the duplicate '代码' (Symbol vs Code) issue in IBKR CSV
+    if (!headerMap.has(headerName)) {
+      headerMap.set(headerName, i);
+    }
+  });
+
+  // Helper to get value by header name (trying multiple aliases)
+  const getValue = (values: string[], aliases: string[]): string => {
+    for (const alias of aliases) {
+      if (headerMap.has(alias)) {
+        return values[headerMap.get(alias)!] || '';
+      }
+    }
+    return '';
+  };
+
+  // Process data lines
+  for (let i = headerLineIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+    // Look for lines starting with Trades,Data,Order or 交易,Data,Order
+    if (!line.startsWith('Trades,Data,Order') && !line.startsWith('交易,Data,Order')) {
+      continue;
+    }
+
+    const values = parseCSVLine(line, ',');
+    
+    // Extract fields
+    const symbol = getValue(values, ['Symbol', '代码', 'Code']);
+    const currency = getValue(values, ['Currency', '货币']);
+    const dateStr = getValue(values, ['Date/Time', '日期/时间', 'DateTime']);
+    const quantityStr = getValue(values, ['Quantity', '数量']);
+    const priceStr = getValue(values, ['T. Price', 'Transaction Price', '交易价格', 'Price']);
+    const proceedsStr = getValue(values, ['Proceeds', '收益', 'Amount']);
+    const commStr = getValue(values, ['Comm/Fee', 'Comm/Tax', '佣金/税', 'Commission']);
+    const assetCategory = getValue(values, ['Asset Category', '资产分类']);
+
+    // Skip if not stock
+    if (assetCategory && !['Stocks', '股票', 'Equity'].includes(assetCategory)) {
+      continue; 
+    }
+
+    // Parse values
+    const quantity = parseFloat(quantityStr.replace(/,/g, ''));
+    if (isNaN(quantity) || quantity === 0) continue;
+
+    const price = parseFloat(priceStr.replace(/,/g, ''));
+    const proceeds = parseFloat(proceedsStr.replace(/,/g, ''));
+    const commission = Math.abs(parseFloat(commStr.replace(/,/g, ''))) || 0;
+
+    // Determine direction
+    const direction = quantity > 0 ? 'BUY' : 'SELL';
+
+    // Determine market based on currency
+    let market = 'US'; // Default
+    if (currency === 'HKD') market = 'HK';
+    else if (currency === 'CNH' || currency === 'CNY') {
+      if (symbol.startsWith('6')) market = 'SH';
+      else market = 'SZ';
+    } else if (currency === 'USD') market = 'US';
+
+    // Format date
+    // IBKR format: "2026-02-12, 01:03:58"
+    const tradeDate = dateStr.split(',')[0].trim();
+
+    // Pad HK stock codes
+    let stockCode = symbol;
+    if (market === 'HK' && /^\d+$/.test(stockCode) && stockCode.length < 5) {
+      stockCode = stockCode.padStart(5, '0');
+    }
+
+    trades.push({
+      stock_code: stockCode,
+      stock_name: stockCode, // IBKR doesn't provide name in this view
+      market,
+      direction,
+      trade_date: tradeDate,
+      price: price,
+      quantity: Math.abs(quantity),
+      amount: Math.abs(proceeds), // Use proceeds as amount
+      commission,
+      strategy: '',
+      entry_reason: '',
+      tags: ['IBKR Import']
+    });
+  }
+
+  return trades;
 }
 
 function detectDelimiter(line: string): string {
@@ -152,11 +274,21 @@ export function detectFormat(data: any[]): string {
   if (headers.some(h => h.includes('证券代码') || h.includes('证券名称'))) {
     return 'broker_standard';
   }
+  
+  // Check if it's our normalized IBKR format
+  if (headers.includes('stock_code') && headers.includes('market') && headers.includes('direction')) {
+    return 'ibkr';
+  }
 
   return 'generic';
 }
 
 export function createFieldMapping(headers: string[]): FieldMapping {
+  // If it's IBKR (normalized), return identity mapping
+  if (headers.includes('stock_code') && headers.includes('market') && headers.includes('direction')) {
+    return { ...IBKR_FIELD_MAPPING };
+  }
+
   const mapping: FieldMapping = {};
 
   for (const header of headers) {
