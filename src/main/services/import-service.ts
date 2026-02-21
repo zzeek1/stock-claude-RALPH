@@ -75,6 +75,25 @@ const DEFAULT_FIELD_MAPPING: FieldMapping = {
   '止盈价': 'take_profit',
 };
 
+const IBKR_FIELD_MAPPING: FieldMapping = {
+  stock_code: 'stock_code',
+  stock_name: 'stock_name',
+  market: 'market',
+  direction: 'direction',
+  trade_date: 'trade_date',
+  price: 'price',
+  quantity: 'quantity',
+  amount: 'amount',
+  commission: 'commission',
+  stamp_tax: 'stamp_tax',
+  strategy: 'strategy',
+  emotion_before: 'emotion_before',
+  entry_reason: 'entry_reason',
+  exit_plan: 'exit_plan',
+  stop_loss: 'stop_loss',
+  take_profit: 'take_profit',
+};
+
 export function parseCSV(content: string): any[] {
   // Check for IBKR format
   if (content.includes('Statement,Header') || content.includes('Statement,Data')) {
