@@ -58,9 +58,11 @@ export const IPC_CHANNELS = {
   // 股票代码搜索
   STOCK_SEARCH: 'stock:search',
   STOCK_IMPORT_CSV: 'stock:importCsv',
+  STOCK_UPDATE_NAMES: 'stock:updateNames',
 
   // 实时行情
   QUOTE_GET: 'quote:get',
+  QUOTE_FX_RATES: 'quote:fxRates',
 
   // 备份
   BACKUP_EXPORT: 'backup:export',

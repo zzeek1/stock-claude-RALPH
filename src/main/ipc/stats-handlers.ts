@@ -94,7 +94,7 @@ export function registerStatsHandlers(): void {
 
   ipcMain.handle(IPC_CHANNELS.STATS_RISK_ASSESSMENT, async () => {
     try {
-      return { success: true, data: statsService.getRiskAssessment() };
+      return { success: true, data: await statsService.getRiskAssessment() };
     } catch (error: any) {
       return { success: false, error: error.message };
     }

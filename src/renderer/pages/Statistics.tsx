@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { Card, Row, Col, Statistic, Spin, Tabs, DatePicker, Select, Alert, Table, Progress, Button, message, Dropdown, Space } from 'antd';
-import type { RiskAssessment } from '../../shared/types';
+import type { RiskAssessment, Trade } from '../../shared/types';
 import {
   ArrowUpOutlined,
   ArrowDownOutlined,
@@ -34,6 +34,9 @@ import {
   Cell,
 } from 'recharts';
 import dayjs, { Dayjs } from 'dayjs';
+import { useCurrencyStore } from '../stores';
+import { convertAmount, currencySymbol, marketCurrency } from '../utils/currency';
+import type { FxRates } from '../utils/currency';
 
 const { RangePicker } = DatePicker;
 
@@ -152,11 +155,126 @@ interface AssetCurveData {
   cumulative_return: number;
 }
 
-interface CalendarHeatmapProps {
-  data: CalendarHeatmapData[];
+interface PositionBrief {
+  market: string;
+  floating_pnl: number;
 }
 
-const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({ data }) => {
+interface CalendarHeatmapProps {
+  data: CalendarHeatmapData[];
+  year: number;
+  moneySymbol?: string;
+}
+
+type TrendPivotRow = Record<string, number | string>;
+
+export function buildStrategyTrendPivot(data: StrategyTrendData[]): { rows: TrendPivotRow[]; strategies: string[] } {
+  const periods = Array.from(new Set(data.map((d) => d.period))).sort();
+  const strategies = Array.from(new Set(data.map((d) => d.strategy)));
+  const rows = periods.map((period) => ({ period } as TrendPivotRow));
+  const rowMap = new Map(rows.map((row) => [row.period as string, row]));
+
+  for (const point of data) {
+    const row = rowMap.get(point.period);
+    if (row) {
+      row[point.strategy] = point.total_pnl;
+    }
+  }
+
+  return { rows, strategies };
+}
+
+export function buildStrategyWinRatePivot(data: StrategyWinRateTrend[]): { rows: TrendPivotRow[]; strategies: string[] } {
+  const periods = Array.from(new Set(data.map((d) => d.period))).sort();
+  const strategies = Array.from(new Set(data.map((d) => d.strategy)));
+  const rows = periods.map((period) => ({ period } as TrendPivotRow));
+  const rowMap = new Map(rows.map((row) => [row.period as string, row]));
+
+  for (const point of data) {
+    const row = rowMap.get(point.period);
+    if (row) {
+      row[point.strategy] = point.win_rate;
+    }
+  }
+
+  return { rows, strategies };
+}
+
+export function normalizeAssetCurveData(
+  assetCurveData: AssetCurveData[],
+  targetStartAssets: number,
+  targetEndAssets: number,
+): AssetCurveData[] {
+  if (!assetCurveData.length) return [];
+
+  const rawStart = Number(assetCurveData[0].total_assets || 0);
+  const rawEnd = Number(assetCurveData[assetCurveData.length - 1].total_assets || 0);
+  const totalSteps = Math.max(1, assetCurveData.length - 1);
+  const startOffset = targetStartAssets - rawStart;
+  const endOffset = targetEndAssets - rawEnd;
+
+  let previousAdjustedAssets = 0;
+  return assetCurveData.map((row, index) => {
+    const progress = assetCurveData.length === 1 ? 1 : index / totalSteps;
+    const offset = startOffset + (endOffset - startOffset) * progress;
+    const adjustedTotalAssets = Number(row.total_assets || 0) + offset;
+    const adjustedDailyPnl = index === 0 ? 0 : adjustedTotalAssets - previousAdjustedAssets;
+    const adjustedDailyReturn =
+      index === 0 || previousAdjustedAssets === 0 ? 0 : adjustedDailyPnl / previousAdjustedAssets;
+    const adjustedCumulativeReturn =
+      targetStartAssets > 0 ? (adjustedTotalAssets - targetStartAssets) / targetStartAssets : 0;
+
+    previousAdjustedAssets = adjustedTotalAssets;
+    return {
+      ...row,
+      total_assets: adjustedTotalAssets,
+      daily_pnl: adjustedDailyPnl,
+      daily_return: adjustedDailyReturn,
+      cumulative_return: adjustedCumulativeReturn,
+    };
+  });
+}
+
+async function fetchAllSellTrades(startDate?: string, endDate?: string): Promise<Trade[]> {
+  const all: Trade[] = [];
+  let page = 1;
+  const pageSize = 500;
+  let total = 0;
+
+  while (page === 1 || all.length < total) {
+    const result = await window.electronAPI.trade.list({
+      direction: 'SELL',
+      startDate,
+      endDate,
+      page,
+      pageSize,
+      sortField: 'trade_date',
+      sortOrder: 'asc',
+    });
+
+    if (!result.success || !result.data) {
+      break;
+    }
+
+    const chunk = result.data.trades || [];
+    total = result.data.total || chunk.length;
+
+    for (const trade of chunk) {
+      if (typeof trade.realized_pnl === 'number') {
+        all.push(trade);
+      }
+    }
+
+    if (chunk.length === 0) {
+      break;
+    }
+    page += 1;
+  }
+
+  return all;
+}
+
+export const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({ data, year, moneySymbol = '¥' }) => {
   const dataMap = useMemo(() => {
     const map = new Map<string, CalendarHeatmapData>();
     data.forEach(d => map.set(d.date, d));
@@ -177,8 +295,6 @@ const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({ data }) => {
 
   const months = useMemo(() => {
     const result: { month: number; weeks: { date: string; day: number }[][] }[] = [];
-    const year = dayjs().year();
-    
     for (let month = 0; month < 12; month++) {
       const startOfMonth = dayjs().year(year).month(month).startOf('month');
       const endOfMonth = startOfMonth.endOf('month');
@@ -213,7 +329,7 @@ const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({ data }) => {
     }
     
     return result;
-  }, []);
+  }, [year]);
 
   return (
     <div style={{ overflowX: 'auto' }}>
@@ -230,7 +346,7 @@ const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({ data }) => {
                   return (
                     <div
                       key={di}
-                      title={d.date && dayData ? `${d.date}: ${dayData.trade_count}笔, ${dayData.pnl > 0 ? '+' : ''}${dayData.pnl.toFixed(2)}元` : ''}
+                      title={d.date && dayData ? `${d.date}: ${dayData.trade_count}笔, ${dayData.pnl > 0 ? '+' : ''}${dayData.pnl.toFixed(2)}${moneySymbol}` : ''}
                       style={{
                         width: 14,
                         height: 14,
@@ -352,6 +468,7 @@ const renderEmotionHeatmap = (data: EmotionHeatmapData[]) => {
 };
 
 const Statistics: React.FC = () => {
+  const { displayCurrency } = useCurrencyStore();
   const [loading, setLoading] = useState<boolean>(true);
   const [dateRange, setDateRange] = useState<[Dayjs, Dayjs] | null>(null);
   const [calendarYear, setCalendarYear] = useState<number>(dayjs().year());
@@ -366,9 +483,30 @@ const Statistics: React.FC = () => {
   const [calendarData, setCalendarData] = useState<CalendarHeatmapData[]>([]);
   const [planStats, setPlanStats] = useState<PlanExecutionStats | null>(null);
   const [assetCurve, setAssetCurve] = useState<AssetCurveData[]>([]);
+  const [positions, setPositions] = useState<PositionBrief[]>([]);
+  const [sellTrades, setSellTrades] = useState<Trade[]>([]);
+  const [fxRates, setFxRates] = useState<FxRates | undefined>(undefined);
+  const [initialCapital, setInitialCapital] = useState(0);
   const [riskAssessment, setRiskAssessment] = useState<RiskAssessment | null>(null);
   const [strategyTrendData, setStrategyTrendData] = useState<StrategyTrendData[]>([]);
   const [strategyWinRateTrend, setStrategyWinRateTrend] = useState<StrategyWinRateTrend[]>([]);
+
+  useEffect(() => {
+    const fetchFxRates = async () => {
+      try {
+        const result = await window.electronAPI.quote.getFxRates();
+        if (result.success && result.data) {
+          setFxRates(result.data);
+        }
+      } catch {
+        // keep previous rates
+      }
+    };
+
+    fetchFxRates();
+    const timer = setInterval(fetchFxRates, 60_000);
+    return () => clearInterval(timer);
+  }, []);
 
   const fetchData = useCallback(async (startDate?: string, endDate?: string) => {
     setLoading(true);
@@ -384,10 +522,13 @@ const Statistics: React.FC = () => {
         calendarRes,
         planRes,
         assetCurveRes,
+        positionsRes,
         riskRes,
         strategyTrendRes,
         strategyWinRateTrendRes,
         emotionHeatmapRes,
+        settingsRes,
+        allSells,
       ] = await Promise.all([
         window.electronAPI.stats.overview(startDate, endDate),
         window.electronAPI.stats.pnlCurve(startDate, endDate),
@@ -399,10 +540,13 @@ const Statistics: React.FC = () => {
         window.electronAPI.stats.calendar(calendarYear),
         window.electronAPI.stats.planExecution(startDate, endDate),
         window.electronAPI.stats.assetCurve(startDate, endDate),
+        window.electronAPI.position.list(),
         window.electronAPI.stats.riskAssessment(),
         window.electronAPI.stats.strategyTrend(startDate, endDate),
         window.electronAPI.stats.strategyWinRateTrend(startDate, endDate),
         window.electronAPI.stats.emotionHeatmap(startDate, endDate),
+        window.electronAPI.settings.get(),
+        fetchAllSellTrades(startDate, endDate),
       ]);
 
       if (overviewRes.success) setOverview(overviewRes.data ?? null);
@@ -415,10 +559,15 @@ const Statistics: React.FC = () => {
       if (calendarRes.success) setCalendarData(calendarRes.data ?? []);
       if (planRes.success) setPlanStats(planRes.data ?? null);
       if (assetCurveRes.success) setAssetCurve(assetCurveRes.data ?? []);
+      if (positionsRes.success) setPositions((positionsRes.data ?? []) as PositionBrief[]);
       if (riskRes.success) setRiskAssessment(riskRes.data ?? null);
       if (strategyTrendRes.success) setStrategyTrendData(strategyTrendRes.data ?? []);
       if (strategyWinRateTrendRes.success) setStrategyWinRateTrend(strategyWinRateTrendRes.data ?? []);
       if (emotionHeatmapRes.success) setEmotionHeatmapData(emotionHeatmapRes.data ?? []);
+      if (settingsRes.success && settingsRes.data) {
+        setInitialCapital(Number(settingsRes.data.initial_capital || 0));
+      }
+      setSellTrades(allSells);
     } catch (error) {
       console.error('Failed to fetch statistics data:', error);
     } finally {
@@ -442,14 +591,14 @@ const Statistics: React.FC = () => {
     }
   };
 
-  // PDF导出
+  // PDF 导出
   const handleExportPdf = async (reportType: 'summary' | 'monthly') => {
     try {
       const startDate = dateRange?.[0]?.format('YYYY-MM-DD');
       const endDate = dateRange?.[1]?.format('YYYY-MM-DD');
       const result = await window.electronAPI.trade.exportPdfReport(reportType, startDate, endDate);
       if (result.success) {
-        message.success('PDF报告已导出到: ' + result.data);
+        message.success('PDF 报告已导出到: ' + result.data);
       } else if (result.error !== '用户取消') {
         message.error(result.error || '导出失败');
       }
@@ -465,18 +614,207 @@ const Statistics: React.FC = () => {
     ],
   };
 
-  const totalPnl = overview?.total_pnl ?? 0;
-  const winRate = overview?.win_rate ?? 0;
-  const profitLossRatio = overview?.profit_loss_ratio ?? 0;
-  const maxDrawdown = overview?.max_drawdown ?? 0;
+  const displaySymbol = currencySymbol(displayCurrency);
+
+  const convertedTradeMetrics = useMemo(() => {
+    if (sellTrades.length === 0) {
+      return null;
+    }
+
+    let realizedPnl = 0;
+    let winCount = 0;
+    let lossCount = 0;
+    let flatCount = 0;
+    let winPnlSum = 0;
+    let lossPnlSum = 0;
+
+    for (const trade of sellTrades) {
+      const fromCurrency = marketCurrency(trade.market);
+      const rawPnl = Number(trade.realized_pnl || 0);
+      const convertedPnl = convertAmount(rawPnl, fromCurrency, displayCurrency, fxRates);
+      realizedPnl += convertedPnl;
+
+      if (convertedPnl > 0) {
+        winCount += 1;
+        winPnlSum += convertedPnl;
+      } else if (convertedPnl < 0) {
+        lossCount += 1;
+        lossPnlSum += convertedPnl;
+      } else {
+        flatCount += 1;
+      }
+    }
+
+    const totalTrades = winCount + lossCount + flatCount;
+    const winRate = totalTrades > 0 ? winCount / totalTrades : 0;
+    const avgWin = winCount > 0 ? winPnlSum / winCount : 0;
+    const avgLoss = lossCount > 0 ? lossPnlSum / lossCount : 0;
+    const profitLossRatio = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
+    const expectancy = winRate * avgWin + (1 - winRate) * avgLoss;
+
+    return {
+      realizedPnl,
+      totalTrades,
+      winRate,
+      avgWin,
+      avgLoss,
+      profitLossRatio,
+      expectancy,
+    };
+  }, [sellTrades, displayCurrency, fxRates]);
+
+  const floatingPnlDisplay = useMemo(() => {
+    return positions.reduce((sum, p) => {
+      const converted = convertAmount(
+        Number(p.floating_pnl || 0),
+        marketCurrency(p.market),
+        displayCurrency,
+        fxRates,
+      );
+      return sum + converted;
+    }, 0);
+  }, [positions, displayCurrency, fxRates]);
+
+  const convertedAssetCurve = useMemo<AssetCurveData[]>(() => {
+    if (!assetCurve.length) return [];
+
+    let lastValidTotalAssets = 0;
+    return assetCurve.map((row) => {
+      const convertedTotalAssets = convertAmount(Number(row.total_assets || 0), 'CNY', displayCurrency, fxRates);
+      const convertedCash = convertAmount(Number(row.cash || 0), 'CNY', displayCurrency, fxRates);
+      const convertedMarketValue = convertAmount(Number(row.market_value || 0), 'CNY', displayCurrency, fxRates);
+      const convertedDailyPnl = convertAmount(Number(row.daily_pnl || 0), 'CNY', displayCurrency, fxRates);
+      const partsTotalAssets = convertedCash + convertedMarketValue;
+
+      let totalAssets = convertedTotalAssets;
+      if (!(totalAssets > 0) && partsTotalAssets > 0) {
+        totalAssets = partsTotalAssets;
+      }
+      if (!(totalAssets > 0) && lastValidTotalAssets > 0) {
+        totalAssets = lastValidTotalAssets;
+      }
+      if (totalAssets > 0) {
+        lastValidTotalAssets = totalAssets;
+      }
+
+      return {
+        ...row,
+        total_assets: totalAssets > 0 ? totalAssets : 0,
+        cash: convertedCash,
+        market_value: convertedMarketValue,
+        daily_pnl: convertedDailyPnl,
+      };
+    });
+  }, [assetCurve, displayCurrency, fxRates]);
+
+  const convertedPnlCurve = useMemo<PnlDataPoint[]>(() => {
+    if (convertedTradeMetrics && sellTrades.length > 0) {
+      const byDate = new Map<string, number>();
+      for (const trade of sellTrades) {
+        const rawPnl = Number(trade.realized_pnl || 0);
+        const converted = convertAmount(rawPnl, marketCurrency(trade.market), displayCurrency, fxRates);
+        byDate.set(trade.trade_date, (byDate.get(trade.trade_date) || 0) + converted);
+      }
+
+      const rows = Array.from(byDate.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+      let cumulative = 0;
+      return rows.map(([date, daily]) => {
+        cumulative += daily;
+        return {
+          date,
+          daily_pnl: daily,
+          cumulative_pnl: cumulative,
+        };
+      });
+    }
+
+    return pnlCurve.map((row) => ({
+      ...row,
+      daily_pnl: convertAmount(Number(row.daily_pnl || 0), 'CNY', displayCurrency, fxRates),
+      cumulative_pnl: convertAmount(Number(row.cumulative_pnl || 0), 'CNY', displayCurrency, fxRates),
+    }));
+  }, [convertedTradeMetrics, sellTrades, pnlCurve, displayCurrency, fxRates]);
+
+  const baseCapital = convertAmount(Number(initialCapital || 0), 'CNY', displayCurrency, fxRates);
+
+  const fallbackAssetCurve = useMemo<AssetCurveData[]>(() => {
+    return convertedPnlCurve.map((row) => {
+      const totalAssets = baseCapital + Number(row.cumulative_pnl || 0);
+      return {
+        date: row.date,
+        total_assets: totalAssets,
+        cash: 0,
+        market_value: totalAssets,
+        daily_pnl: Number(row.daily_pnl || 0),
+        daily_return: baseCapital > 0 ? Number(row.daily_pnl || 0) / baseCapital : 0,
+        cumulative_return: baseCapital > 0 ? Number(row.cumulative_pnl || 0) / baseCapital : 0,
+      };
+    });
+  }, [convertedPnlCurve, baseCapital]);
+
+  const displayAssetCurve = useMemo<AssetCurveData[]>(() => {
+    return convertedAssetCurve.length > 0 ? convertedAssetCurve : fallbackAssetCurve;
+  }, [convertedAssetCurve, fallbackAssetCurve]);
+
+  const realizedPnl =
+    convertedTradeMetrics?.realizedPnl ??
+    convertAmount(Number(overview?.total_pnl ?? 0), 'CNY', displayCurrency, fxRates);
+  const unrealizedPnl = floatingPnlDisplay;
+  const totalPnl = realizedPnl + unrealizedPnl;
+  const totalTrades = convertedTradeMetrics?.totalTrades ?? (overview?.total_trades ?? 0);
+  const winRate = convertedTradeMetrics?.winRate ?? (overview?.win_rate ?? 0);
+  const profitLossRatio = convertedTradeMetrics?.profitLossRatio ?? (overview?.profit_loss_ratio ?? 0);
   const avgHoldingDays = overview?.avg_holding_days ?? 0;
   const maxConsecutiveWins = overview?.max_consecutive_wins ?? 0;
   const maxConsecutiveLosses = overview?.max_consecutive_losses ?? 0;
-  const expectancy = overview?.expectancy ?? 0;
+  const expectancy =
+    convertedTradeMetrics?.expectancy ??
+    convertAmount(Number(overview?.expectancy ?? 0), 'CNY', displayCurrency, fxRates);
   const impulsiveTradeCount = overview?.impulsive_trade_count ?? 0;
   const stopLossRate = overview?.stop_loss_execution_rate ?? 0;
-  const totalTrades = overview?.total_trades ?? 0;
-  const totalReturn = overview?.total_return ?? 0;
+
+  const latestValidAssetPoint = [...displayAssetCurve].reverse().find((point) => Number(point.total_assets) > 0) ?? null;
+  const computedTotalAssets = baseCapital + totalPnl;
+  const totalAssets = latestValidAssetPoint
+    ? latestValidAssetPoint.total_assets
+    : computedTotalAssets > 0
+      ? computedTotalAssets
+      : baseCapital > 0
+        ? baseCapital
+        : 0;
+
+  const baselineAssetsForReturn = totalAssets - totalPnl;
+  const totalReturn = baselineAssetsForReturn > 0 ? totalPnl / baselineAssetsForReturn : 0;
+
+  const normalizedAssetCurve = useMemo<AssetCurveData[]>(() => {
+    if (!displayAssetCurve.length) {
+      return [];
+    }
+    return normalizeAssetCurveData(displayAssetCurve, baselineAssetsForReturn, totalAssets);
+  }, [displayAssetCurve, baselineAssetsForReturn, totalAssets]);
+
+  const displayDrawdownData = useMemo<DrawdownData[]>(() => {
+    if (!normalizedAssetCurve.length) {
+      return drawdownData.map((point) => ({ ...point, drawdown: Math.abs(Number(point.drawdown || 0)) }));
+    }
+
+    let peak = 0;
+    return normalizedAssetCurve.map((point) => {
+      const value = Number(point.total_assets || 0);
+      peak = Math.max(peak, value);
+      const drawdown = peak > 0 ? (peak - value) / peak : 0;
+      return {
+        date: point.date,
+        drawdown,
+        peak,
+        value,
+      };
+    });
+  }, [normalizedAssetCurve, drawdownData]);
+
+  const maxDrawdown = displayDrawdownData.length > 0
+    ? displayDrawdownData.reduce((max, point) => Math.max(max, Number(point.drawdown || 0)), 0)
+    : (overview?.max_drawdown ?? 0);
   
   const planTotal = planStats?.total_with_plan ?? 0;
   const planExecuted = planStats?.executed_count ?? 0;
@@ -490,16 +828,16 @@ const Statistics: React.FC = () => {
     {
       key: 'assetCurve',
       label: '资产曲线',
-      children: assetCurve.length > 0 ? (
+      children: normalizedAssetCurve.length > 0 ? (
         <ResponsiveContainer width="100%" height={400}>
-          <LineChart data={assetCurve} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+          <LineChart data={normalizedAssetCurve} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey="date" fontSize={12} />
             <YAxis fontSize={12} />
             <Tooltip
               formatter={(value: number, name: string) => {
-                if (name === '总资产' || name === '现金' || name === '市值') return [value.toFixed(2) + ' 元', name];
-                if (name === '每日盈亏') return [value.toFixed(2) + ' 元', name];
+                if (name === '总资产' || name === '现金' || name === '市值') return [value.toFixed(0) + ` ${displaySymbol}`, name];
+                if (name === '当日盈亏') return [value.toFixed(0) + ` ${displaySymbol}`, name];
                 if (name === '累计收益率') return [(value * 100).toFixed(2) + '%', name];
                 return [value, name];
               }}
@@ -537,7 +875,7 @@ const Statistics: React.FC = () => {
         </ResponsiveContainer>
       ) : (
         <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>
-          暂无账户快照数据，请先在"设置"中保存账户快照或在"持仓"页面生成快照
+          暂无账户快照数据，请先在设置中保存账户快照或在持仓页面生成快照
         </div>
       ),
     },
@@ -546,12 +884,12 @@ const Statistics: React.FC = () => {
       label: '收益曲线',
       children: (
         <ResponsiveContainer width="100%" height={400}>
-          <LineChart data={pnlCurve} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+          <LineChart data={convertedPnlCurve} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey="date" fontSize={12} />
             <YAxis fontSize={12} />
             <Tooltip
-              formatter={(value: number) => [value.toFixed(2) + ' 元', '']}
+              formatter={(value: number) => [value.toFixed(0) + ` ${displaySymbol}`, '']}
               labelFormatter={(label: string) => `日期: ${label}`}
             />
             <Legend />
@@ -567,7 +905,7 @@ const Statistics: React.FC = () => {
             <Line
               type="monotone"
               dataKey="daily_pnl"
-              name="每日盈亏"
+              name="当日盈亏"
               stroke="#8884d8"
               strokeWidth={1}
               dot={false}
@@ -615,7 +953,7 @@ const Statistics: React.FC = () => {
             <YAxis yAxisId="right" orientation="right" fontSize={12} />
             <Tooltip
               formatter={(value: number, name: string) => {
-                if (name === '总盈亏' || name === '平均盈亏') return [value.toFixed(2) + ' 元', name];
+                if (name === '总盈亏' || name === '平均盈亏') return [value.toFixed(0) + ` ${displaySymbol}`, name];
                 if (name === '胜率') return [(value * 100).toFixed(1) + '%', name];
                 return [value, name];
               }}
@@ -653,7 +991,7 @@ const Statistics: React.FC = () => {
             <Tooltip
               formatter={(value: number, name: string) => {
                 if (name === '胜率') return [(value * 100).toFixed(1) + '%', name];
-                if (name === '平均盈亏') return [value.toFixed(2) + ' 元', name];
+                if (name === '平均盈亏') return [value.toFixed(0) + ` ${displaySymbol}`, name];
                 return [value, name];
               }}
             />
@@ -694,7 +1032,7 @@ const Statistics: React.FC = () => {
             <YAxis yAxisId="right" orientation="right" fontSize={12} tickFormatter={(v: number) => (v * 100).toFixed(0) + '%'} />
             <Tooltip
               formatter={(value: number, name: string) => {
-                if (name === '总盈亏') return [value.toFixed(2) + ' 元', name];
+                if (name === '总盈亏') return [value.toFixed(0) + ` ${displaySymbol}`, name];
                 if (name === '胜率') return [(value * 100).toFixed(1) + '%', name];
                 return [value, name];
               }}
@@ -707,7 +1045,7 @@ const Statistics: React.FC = () => {
         </ResponsiveContainer>
       ) : (
         <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>
-          暂无策略趋势数据，请先添加有策略标签的交易记录
+          暂无策略趋势数据，请先添加带策略标签的交易记录
         </div>
       ),
     },
@@ -744,7 +1082,7 @@ const Statistics: React.FC = () => {
         </ResponsiveContainer>
       ) : (
         <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>
-          暂无胜率趋势数据，请先添加有策略标签的交易记录
+          暂无胜率趋势数据，请先添加带策略标签的交易记录
         </div>
       ),
     },
@@ -759,7 +1097,7 @@ const Statistics: React.FC = () => {
         </div>
       ) : (
         <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>
-          暂无情绪热力图数据，请先添加有情绪记录的交易
+          暂无情绪热力图数据，请先添加带情绪记录的交易
         </div>
       ),
     },
@@ -775,7 +1113,7 @@ const Statistics: React.FC = () => {
             <YAxis yAxisId="right" orientation="right" fontSize={12} />
             <Tooltip
               formatter={(value: number, name: string) => {
-                if (name === '盈亏') return [value.toFixed(2) + ' 元', name];
+                if (name === '盈亏') return [value.toFixed(0) + ` ${displaySymbol}`, name];
                 if (name === '胜率') return [(value * 100).toFixed(1) + '%', name];
                 return [value, name];
               }}
@@ -805,7 +1143,7 @@ const Statistics: React.FC = () => {
       label: '最大回撤',
       children: (
         <ResponsiveContainer width="100%" height={400}>
-          <AreaChart data={drawdownData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+          <AreaChart data={displayDrawdownData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey="date" fontSize={12} />
             <YAxis fontSize={12} tickFormatter={(v: number) => (v * 100).toFixed(1) + '%'} />
@@ -849,44 +1187,8 @@ const Statistics: React.FC = () => {
               ))}
             </Select>
           </div>
-          <CalendarHeatmap data={calendarData} />
+          <CalendarHeatmap data={calendarData} year={calendarYear} moneySymbol={displaySymbol} />
         </div>
-      ),
-    },
-    {
-      key: 'emotionHeatmap',
-      label: '情绪-胜率热力图',
-      children: (
-        <ResponsiveContainer width="100%" height={400}>
-          <BarChart data={emotionStats} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="emotion" fontSize={12} />
-            <YAxis yAxisId="left" fontSize={12} domain={[0, 1]} tickFormatter={(v: number) => (v * 100).toFixed(0) + '%'} />
-            <YAxis yAxisId="right" orientation="right" fontSize={12} />
-            <Tooltip
-              formatter={(value: number, name: string) => {
-                if (name === '胜率') return [(value * 100).toFixed(1) + '%', name];
-                if (name === '平均盈亏') return [value.toFixed(2) + ' 元', name];
-                return [value, name];
-              }}
-            />
-            <Legend />
-            <Bar
-              yAxisId="left"
-              dataKey="win_rate"
-              name="胜率"
-              fill="#1677ff"
-              radius={[4, 4, 0, 0]}
-            />
-            <Bar
-              yAxisId="right"
-              dataKey="trade_count"
-              name="交易次数"
-              fill="#faad14"
-              radius={[4, 4, 0, 0]}
-            />
-          </BarChart>
-        </ResponsiveContainer>
       ),
     },
     {
@@ -894,29 +1196,41 @@ const Statistics: React.FC = () => {
       label: '风险评估',
       children: riskAssessment ? (
         <div>
-          {/* Risk Level Banner */}
           <Alert
             message={
               <span>
                 风险等级：
-                <span style={{
-                  fontWeight: 'bold',
-                  color: riskAssessment.overall_risk_level === 'high' ? '#ff4d4f' :
-                         riskAssessment.overall_risk_level === 'medium' ? '#faad14' : '#52c41a'
-                }}>
-                  {riskAssessment.overall_risk_level === 'high' ? '高风险' :
-                   riskAssessment.overall_risk_level === 'medium' ? '中等风险' : '低风险'}
+                <span
+                  style={{
+                    fontWeight: 'bold',
+                    color:
+                      riskAssessment.overall_risk_level === 'high'
+                        ? '#ff4d4f'
+                        : riskAssessment.overall_risk_level === 'medium'
+                          ? '#faad14'
+                          : '#52c41a',
+                  }}
+                >
+                  {riskAssessment.overall_risk_level === 'high'
+                    ? '高风险'
+                    : riskAssessment.overall_risk_level === 'medium'
+                      ? '中等风险'
+                      : '低风险'}
                 </span>
               </span>
             }
-            type={riskAssessment.overall_risk_level === 'high' ? 'error' :
-                  riskAssessment.overall_risk_level === 'medium' ? 'warning' : 'success'}
+            type={
+              riskAssessment.overall_risk_level === 'high'
+                ? 'error'
+                : riskAssessment.overall_risk_level === 'medium'
+                  ? 'warning'
+                  : 'success'
+            }
             showIcon
             icon={<ExclamationCircleOutlined />}
             style={{ marginBottom: 16 }}
           />
 
-          {/* Warnings */}
           {riskAssessment.risk_warnings.length > 0 && (
             <Alert
               message="风险提示"
@@ -934,111 +1248,56 @@ const Statistics: React.FC = () => {
           )}
 
           <Row gutter={16}>
-            {/* Risk Exposure Section */}
             <Col span={12}>
               <Card title="风险敞口" size="small">
                 <Statistic
                   title="总市值"
                   value={riskAssessment.exposure.total_market_value}
-                  precision={2}
-                  prefix="¥"
+                  precision={0}
+                  suffix={displaySymbol}
                 />
                 <Statistic
                   title="总敞口占比"
                   value={riskAssessment.exposure.total_exposure * 100}
                   precision={1}
                   suffix="%"
-                  valueStyle={{ color: riskAssessment.exposure.total_exposure > 0.8 ? '#ff4d4f' : undefined }}
                 />
                 <Statistic
                   title="最大单一仓位"
                   value={riskAssessment.exposure.largest_position_pct * 100}
                   precision={1}
                   suffix="%"
-                  valueStyle={{ color: riskAssessment.exposure.largest_position_pct > 0.3 ? '#ff4d4f' : undefined }}
                 />
               </Card>
             </Col>
-
-            {/* Risk Reward Section */}
             <Col span={12}>
               <Card title="风险收益比" size="small">
                 <Statistic
                   title="当前风险收益比"
                   value={riskAssessment.risk_reward.current_risk_reward}
                   precision={2}
-                  valueStyle={{ color: riskAssessment.risk_reward.current_risk_reward >= 1 ? '#52c41a' : '#ff4d4f' }}
                 />
                 <Statistic
-                  title="设置止损的仓位"
+                  title="已设止损仓位数"
                   value={riskAssessment.risk_reward.positions_with_sl}
                 />
                 <Statistic
-                  title="潜在上涨空间"
+                  title="潜在上行空间"
                   value={riskAssessment.risk_reward.potential_upside}
                   precision={0}
-                  prefix="¥"
+                  suffix={displaySymbol}
                 />
                 <Statistic
-                  title="潜在下跌风险"
+                  title="潜在下行风险"
                   value={riskAssessment.risk_reward.potential_downside}
                   precision={0}
-                  prefix="¥"
+                  suffix={displaySymbol}
                   valueStyle={{ color: '#ff4d4f' }}
                 />
               </Card>
             </Col>
           </Row>
 
-          <Row gutter={16} style={{ marginTop: 16 }}>
-            {/* Max Potential Loss Section */}
-            <Col span={12}>
-              <Card title="最大潜在损失" size="small">
-                <Statistic
-                  title="全部止损损失"
-                  value={riskAssessment.max_potential_loss.if_all_stop_loss}
-                  precision={0}
-                  prefix="¥"
-                  valueStyle={{ color: '#ff4d4f' }}
-                />
-                <Statistic
-                  title="损失占比"
-                  value={riskAssessment.max_potential_loss.if_all_stop_loss_pct * 100}
-                  precision={1}
-                  suffix="%"
-                  valueStyle={{ color: riskAssessment.max_potential_loss.if_all_stop_loss_pct > 0.5 ? '#ff4d4f' : undefined }}
-                />
-                <Statistic
-                  title="单笔最大损失"
-                  value={riskAssessment.max_potential_loss.largest_single_loss}
-                  precision={0}
-                  prefix="¥"
-                />
-              </Card>
-            </Col>
-
-            {/* Cash Coverage */}
-            <Col span={12}>
-              <Card title="资金状况" size="small">
-                <Statistic
-                  title="可用资金"
-                  value={riskAssessment.max_potential_loss.cash_available}
-                  precision={0}
-                  prefix="¥"
-                />
-                <div style={{ marginTop: 16 }}>
-                  <div>能否覆盖全部损失：</div>
-                  <Progress
-                    percent={riskAssessment.max_potential_loss.can_cover_loss ? 100 : 0}
-                    status={riskAssessment.max_potential_loss.can_cover_loss ? 'success' : 'exception'}
-                    format={() => riskAssessment.max_potential_loss.can_cover_loss ? '是' : '否'}
-                  />
-                </div>
-              </Card>
-            </Col>
-          </Row>
-
-          {/* Stock Exposure Table */}
           {riskAssessment.exposure.stock_exposure.length > 0 && (
             <Card title="股票敞口 (Top 10)" size="small" style={{ marginTop: 16 }}>
               <Table
@@ -1050,7 +1309,7 @@ const Statistics: React.FC = () => {
                   { title: '代码', dataIndex: 'stock_code', key: 'stock_code' },
                   { title: '名称', dataIndex: 'stock_name', key: 'stock_name' },
                   { title: '市值', dataIndex: 'value', key: 'value', render: (v: number) => v.toFixed(0) },
-                  { title: '占比', dataIndex: 'percentage', key: 'percentage', render: (p: number) => (p * 100).toFixed(1) + '%' },
+                  { title: '占比', dataIndex: 'percentage', key: 'percentage', render: (p: number) => `${(p * 100).toFixed(1)}%` },
                 ]}
               />
             </Card>
@@ -1109,11 +1368,11 @@ const Statistics: React.FC = () => {
               <Card variant="borderless" hoverable size="small">
                 <Statistic
                   title="总盈亏"
-                  value={totalPnl.toFixed(2)}
-                  precision={2}
+                  value={totalPnl}
+                  precision={0}
                   valueStyle={{ color: totalPnl >= 0 ? '#52c41a' : '#ff4d4f', fontSize: 18 }}
                   prefix={totalPnl >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
-                  suffix="元"
+                  suffix={displaySymbol}
                 />
               </Card>
             </Col>
@@ -1181,7 +1440,7 @@ const Statistics: React.FC = () => {
             <Col xs={24} sm={12} md={8} lg={6} xl={4}>
               <Card variant="borderless" hoverable size="small">
                 <Statistic
-                  title="最大连胜"
+                  title="最大连赢"
                   value={maxConsecutiveWins}
                   valueStyle={{ color: '#52c41a', fontSize: 18 }}
                   prefix={<FireOutlined />}
@@ -1207,7 +1466,7 @@ const Statistics: React.FC = () => {
                   value={expectancy.toFixed(2)}
                   valueStyle={{ color: expectancy >= 0 ? '#52c41a' : '#ff4d4f', fontSize: 18 }}
                   prefix={<DollarOutlined />}
-                  suffix="元"
+                  suffix={displaySymbol}
                 />
               </Card>
             </Col>
@@ -1259,7 +1518,7 @@ const Statistics: React.FC = () => {
                       title="执行/错过平均盈亏"
                       value={`${planExecutedAvgPnl.toFixed(0)}/${planMissedAvgPnl.toFixed(0)}`}
                       valueStyle={{ color: planExecutedAvgPnl > planMissedAvgPnl ? '#52c41a' : '#ff4d4f', fontSize: 16 }}
-                      suffix="元"
+                      suffix={displaySymbol}
                     />
                   </Card>
                 </Col>

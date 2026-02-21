@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, createContext, useContext } from 'react';
-import { Layout, Menu, message } from 'antd';
+import { Layout, Menu, Segmented, Space, Typography } from 'antd';
 import {
   DashboardOutlined,
   PlusCircleOutlined,
@@ -13,8 +13,11 @@ import {
   BookOutlined,
 } from '@ant-design/icons';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
+import { useCurrencyStore } from '../../stores';
+import type { CurrencyCode } from '../../utils/currency';
 
 const { Sider, Content } = Layout;
+const { Text } = Typography;
 
 type SaveCallback = () => void;
 
@@ -49,6 +52,8 @@ const AppLayout: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const saveCallbackRef = useRef<SaveCallback | null>(null);
+  const { displayCurrency, setDisplayCurrency } = useCurrencyStore();
+  const showCurrencyControl = location.pathname !== '/new-trade';
 
   useEffect(() => {
     const cleanupNewTrade = window.electronAPI.shortcut.onNewTrade(() => {
@@ -108,6 +113,23 @@ const AppLayout: React.FC = () => {
             background: '#f5f5f5',
             overflow: 'auto',
           }}>
+            {showCurrencyControl && (
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+                <Space size={8}>
+                  <Text type="secondary">统一币种</Text>
+                  <Segmented<CurrencyCode>
+                    size="small"
+                    value={displayCurrency}
+                    onChange={(next) => setDisplayCurrency(next as CurrencyCode)}
+                    options={[
+                      { label: '人民币 CNY', value: 'CNY' },
+                      { label: '港币 HKD', value: 'HKD' },
+                      { label: '美元 USD', value: 'USD' },
+                    ]}
+                  />
+                </Space>
+              </div>
+            )}
             <Outlet />
           </Content>
         </Layout>

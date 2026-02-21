@@ -2,17 +2,23 @@
  * Longbridge 实时行情服务
  */
 import { Config, QuoteContext } from "longbridge";
+import { Period, AdjustType, NaiveDate } from "longbridge";
+import { writeLog } from "../index";
 
 // 硬编码的凭证
 const APP_KEY = "110cf270ca570e1b8b60b8a74bef3346";
 const APP_SECRET = "721b3835d40a07b2a1146ad6f9b3254c1007c8443b3ab9328485a244cb460f39";
-const ACCESS_TOKEN = "m_eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb25nYnJpZGdlIiwic3ViIjoiYWNjZXNzX3Rva2VuIiwiZXhwIjoxNzc3NDc1MTkwLCJpYXQiOjE3Njk2OTkxOTEsImFrIjoiMTEwY2YyNzBjYTU3MGUxYjhiNjBiOGE3NGJlZjMzNDYiLCJhYWlkIjoyMDg2MTQ1NCwiYWMiOiJsYl9wYXBlcnRyYWRpbmciLCJtaWQiOjE2Mzg0NTQ4LCJzaWQiOiJlaW9ick5LT0k2QzdXTGhtYVZSeCtRPT0iLCJibCI6MywidWwiOjAsImlrIjoibGJfcGFwZXJ0cmFkaW5nXzIwODYxNDU0In0.tIayuixRJTc-ZahxVtjl8jZU80wyn2n-UMO5Z-BoBQ8H7yzeJUA9pxGjUHTSsRZm0uLWe1l7oj_eBM-WgmTO4Dty8bs5_l0PTcQjaF2mFW9HNEBj8ITwnxRsnbSzRiLNTFKPJl8ckKV0HfNhed_Kzf7uRkGWoYt3hrKDS8Dr_XwJX6Kv4WUJQ3k9bqO3r8nptqRuY6XI7z7TCwLb-ZhdO67VwPi6KDNC-Gk9wLsoWmaZtLIyGX1f2i2gF70JK-J4BfAIqPMqP3N1Uh6Xoq0h--aAI9YQDl8PYhVyBh-EuxpwjQoaO-kUjRxeQKtgLDj3dj0EW8dmGqsa-VQw2o4xG3px4mPDfsd6JuoeupIfVPiMqmwRK1LiFa0OnCuNajnDIzd-6IGi8QDKfWlk-VpjT9WPsw8be7QKMmt804RA-O8Llmk6ZR4LTxLlRKHJq031IkPsRPUS-tx7QYDWjOxa_mKgOozqIR1YuoiUdYTy1uDX-sT2iXOv2uQ19Cmo79qRFxcPsDkO1XJDr1kSA0_gsBj5GpNawbOPITPtuE6NVcYjHU8lHItrs7QulE_9jUb0CPgO21yC29yMuYEnmCKG9MhVOmkbV9RMAI53VOuk_GlmsptLs0aEewD-A-bts2K0daKp207K3C4qhoJk2F9d2go8fM8cDEJbU2bZgzYwvv4";
+const ACCESS_TOKEN = "m_eyJhbGciOiJSUzI1NiIsImtpZCI6ImQ5YWRiMGIxYTdlNzYxNzEiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJsb25nYnJpZGdlIiwic3ViIjoiYWNjZXNzX3Rva2VuIiwiZXhwIjoxNzc5Mzc2MDM3LCJpYXQiOjE3NzE2MDAwMzgsImFrIjoiIiwiYWFpZCI6MjA4NjE0NTQsImFjIjoibGJfcGFwZXJ0cmFkaW5nIiwibWlkIjoxNjM4NDU0OCwic2lkIjoiQWFZU0t5enpKZVQ5QWxZekVVTHdhdz09IiwiYmwiOjMsInVsIjowLCJpayI6ImxiX3BhcGVydHJhZGluZ18yMDg2MTQ1NCJ9.DkgdRyp-PpCeMIKnawzR4a_aNwBPv2aV56-5UfCCb677D3WoJKxzqxt07wWlTw9xPs-ql5_3FgVa_viEskl1JCekT77DtReHx7A_ZgTlvjNpHq_3-5HtPxBR1Gd3j0knmziJcIH80FlMAIlj7Mk-h26YQVNMueG7XaYYcAEf8PVSNycqbAdvR_vuLRFngTJAGtVZyyiSl_L6PrnJNbh8-JN-wi6zaR4j_Q3z8QBLhzOU231_TaEMMUvG47elqiu7GcvR2XT6tEyujLYmannwBdJSsUrPSQJAI2tE4V7BIRNzhnOsTI7ydufh5jqkSX73wbVbUrcDIyHsq0tIXrM-iRtUgcoHp0mS0UElZRd2hTwKMqNaKaHvGm4boXFewSqwwDlT92pYx_bzi1ZrfAHshAEfsaelBseLpWyzHfoLaIx5Rnj525ZyX5O4r0L5CtLHnbzkEsiCFBaJtqJ5HFTFJbcSc_a3bhxqnVJ-JD8zR7HYdEkowbPWhVV95LiSxdx8j1aL8b7rSCKd34IGwDP9zh7v0uvf96AskZyosv1PFAFey14ha1J4RoVRRSMca2fbw_XZiNzIZShYWIiHsRL9j8jKYtv9utivd1ltvZBRiPanu45JHwAd_-NFI3FCZLmWAf_60rH61bd4VV168O-UNiKQzUQwzAg3z3Vi8Y53KrI";
 
 // 缓存配置，避免重复创建
 let configInstance: Config | null = null;
 let quoteContextInstance: QuoteContext | null = null;
 const quoteCache = new Map<string, { data: QuoteInfo; timestamp: number }>();
 const CACHE_TTL = 3000; // 3 seconds
+const historyCache = new Map<string, { data: HistoricalDailyClose[]; timestamp: number }>();
+const HISTORY_CACHE_TTL = 10 * 60_000; // 10 minutes
+let fxRatesCache: { data: FxRates; timestamp: number } | null = null;
+const FX_CACHE_TTL = 60_000; // 60 seconds
 
 function getConfig(): Config {
   if (!configInstance) {
@@ -69,8 +75,11 @@ export async function getQuotes(symbols: string[]): Promise<QuoteInfo[]> {
   }
 
   try {
+    writeLog('[Quote] Fetching quotes for:', symbolsToFetch);
     const ctx = await getQuoteContext();
+    writeLog('[Quote] QuoteContext created, fetching quotes...');
     const quotes = await ctx.quote(symbolsToFetch);
+    writeLog('[Quote] Received quotes:', quotes.length);
     
     const fetchedQuotes = quotes.map(q => {
       const info: QuoteInfo = {
@@ -98,11 +107,113 @@ export async function getQuotes(symbols: string[]): Promise<QuoteInfo[]> {
 
     return [...result, ...fetchedQuotes];
   } catch (error) {
-    console.error("Failed to fetch quotes:", error);
+    writeLog("[Quote] Failed to fetch quotes:", error);
     // If fetch fails, try to return stale cache if available, or throw
     // For now, let's just re-throw
     throw error;
   }
+}
+
+export interface FxRates {
+  // 1 USD = x CURRENCY
+  USD: number;
+  HKD: number;
+  CNY: number;
+  timestamp: string;
+}
+
+export interface HistoricalDailyClose {
+  date: string;
+  close: number;
+}
+
+function toNaiveDate(dateStr?: string | null): NaiveDate | undefined {
+  if (!dateStr) return undefined;
+  const [y, m, d] = String(dateStr).split('-').map((v) => Number(v));
+  if (!y || !m || !d) return undefined;
+  return new NaiveDate(y, m, d);
+}
+
+function toMarketDateString(timestamp: Date, symbol: string): string {
+  const isUs = symbol.endsWith('.US');
+  const timeZone = isUs ? 'America/New_York' : 'Asia/Shanghai';
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(timestamp);
+}
+
+export async function getFxRates(): Promise<FxRates> {
+  const now = Date.now();
+  if (fxRatesCache && now - fxRatesCache.timestamp < FX_CACHE_TTL) {
+    return fxRatesCache.data;
+  }
+
+  const resp = await fetch('https://open.er-api.com/v6/latest/USD');
+  if (!resp.ok) {
+    throw new Error(`FX API failed: ${resp.status}`);
+  }
+
+  const payload = await resp.json() as {
+    result?: string;
+    rates?: Record<string, number>;
+    time_last_update_utc?: string;
+  };
+
+  const usd = 1;
+  const hkd = payload?.rates?.HKD;
+  const cny = payload?.rates?.CNY;
+
+  if (!hkd || !cny) {
+    throw new Error('FX API missing HKD/CNY rates');
+  }
+
+  const data: FxRates = {
+    USD: usd,
+    HKD: hkd,
+    CNY: cny,
+    timestamp: payload.time_last_update_utc || new Date().toISOString(),
+  };
+
+  fxRatesCache = { data, timestamp: now };
+  return data;
+}
+
+export async function getHistoryDailyCloses(
+  symbol: string,
+  startDate?: string,
+  endDate?: string,
+): Promise<HistoricalDailyClose[]> {
+  const cacheKey = `${symbol}|${startDate || ''}|${endDate || ''}`;
+  const now = Date.now();
+  const cached = historyCache.get(cacheKey);
+  if (cached && now - cached.timestamp < HISTORY_CACHE_TTL) {
+    return cached.data;
+  }
+
+  const ctx = await getQuoteContext();
+  const start = toNaiveDate(startDate);
+  const end = toNaiveDate(endDate);
+  const candles = await ctx.historyCandlesticksByDate(
+    symbol,
+    Period.Day,
+    AdjustType.NoAdjust,
+    start,
+    end,
+  );
+
+  const rows = candles
+    .map((candle) => ({
+      date: toMarketDateString(candle.timestamp, symbol),
+      close: Number(candle.close?.toString() || 0),
+    }))
+    .filter((row) => row.close > 0)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  historyCache.set(cacheKey, { data: rows, timestamp: now });
+  return rows;
 }
 
 /**

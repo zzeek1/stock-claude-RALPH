@@ -62,9 +62,11 @@ interface ElectronAPI {
   stock: {
     search: (keyword: string) => Promise<IpcResponse<StockCode[]>>;
     importCsv: (csvContent: string) => Promise<IpcResponse<{ added: number; total: number }>>;
+    updateNames: () => Promise<IpcResponse<{ updated: number }>>;
   };
   quote: {
     get: (symbols: string[]) => Promise<IpcResponse<QuoteInfo[]>>;
+    getFxRates: () => Promise<IpcResponse<FxRates>>;
   };
   backup: {
     export: () => Promise<IpcResponse<string>>;
@@ -141,6 +143,13 @@ interface QuoteInfo {
   volume: string;
   turnover: string;
   timestamp: Date;
+}
+
+interface FxRates {
+  USD: number;
+  HKD: number;
+  CNY: number;
+  timestamp: string;
 }
 
 declare global {

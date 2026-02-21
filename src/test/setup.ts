@@ -16,6 +16,18 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 });
 
+// Mock ResizeObserver for Recharts
+class ResizeObserverMock {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+Object.defineProperty(window, 'ResizeObserver', {
+  writable: true,
+  value: ResizeObserverMock,
+});
+
 // Mock getComputedStyle for jsdom
 const originalGetComputedStyle = window.getComputedStyle;
 vi.spyOn(window, 'getComputedStyle').mockImplementation((el) => {

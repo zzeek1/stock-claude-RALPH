@@ -123,6 +123,7 @@ export interface Settings {
   initial_capital: number;
   ai_provider: string;
   api_key_encrypted: string;
+  ai_base_url?: string;
   ai_model: string;
   default_commission_rate: number;
   default_stamp_tax_rate: number;
@@ -175,6 +176,8 @@ export interface StatsOverview {
   max_drawdown: number;
   max_consecutive_wins: number;
   max_consecutive_losses: number;
+  current_consecutive_wins: number;
+  current_consecutive_losses: number;
   avg_holding_days: number;
   impulsive_trade_count: number;
   impulsive_trade_win_rate: number;

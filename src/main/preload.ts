@@ -93,11 +93,13 @@ const api = {
   stock: {
     search: (keyword: string) => ipcRenderer.invoke(IPC_CHANNELS.STOCK_SEARCH, keyword),
     importCsv: (csvContent: string) => ipcRenderer.invoke(IPC_CHANNELS.STOCK_IMPORT_CSV, csvContent),
+    updateNames: () => ipcRenderer.invoke(IPC_CHANNELS.STOCK_UPDATE_NAMES),
   },
 
   // 实时行情
   quote: {
     get: (symbols: string[]) => ipcRenderer.invoke(IPC_CHANNELS.QUOTE_GET, symbols),
+    getFxRates: () => ipcRenderer.invoke(IPC_CHANNELS.QUOTE_FX_RATES),
   },
 
   // 备份

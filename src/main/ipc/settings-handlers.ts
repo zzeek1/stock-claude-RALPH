@@ -3,6 +3,7 @@ import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import * as settingsService from '../services/settings-service';
 import * as backupService from '../services/backup-service';
 import { StockCode } from '../../shared/types';
+import { inferMarketFromCode } from '../../shared/market-utils';
 
 // In-memory stock code cache
 let stockCodes: StockCode[] = [];
@@ -90,6 +91,31 @@ const DEFAULT_STOCK_CODES: StockCode[] = [
     { code: '02269', name: '药明生物', market: 'HK' },
     { code: '03888', name: '金山软件', market: 'HK' },
     { code: '00267', name: '新天绿色', market: 'HK' },
+    // 更多港股
+    { code: '00553', name: '南京熊猫电子股份', market: 'HK' },
+    { code: '01318', name: '金川国际', market: 'HK' },
+    { code: '00968', name: '信义能源', market: 'HK' },
+    { code: '01776', name: '华润电力', market: 'HK' },
+    { code: '01816', name: '小鹏汽车-W', market: 'HK' },
+    { code: '02020', name: '安踏体育', market: 'HK' },
+    { code: '02050', name: '中国平安(繁体)', market: 'HK' },
+    { code: '02259', name: '新天绿色能源', market: 'HK' },
+    { code: '02513', name: '中国平安(繁体2)', market: 'HK' },
+    { code: '06862', name: '海底捞', market: 'HK' },
+    { code: '07709', name: '中国中铁', market: 'HK' },
+    { code: '09868', name: '小鹏汽车-W', market: 'HK' },
+    { code: '01000', name: '华润燃气', market: 'HK' },
+    { code: '01428', name: '民生银行', market: 'HK' },
+    { code: '06881', name: '中国中铁', market: 'HK' },
+    { code: '09992', name: '泡泡玛特', market: 'HK' },
+    { code: '06181', name: '中国中铁', market: 'HK' },
+    { code: '00799', name: '中国平安(繁体3)', market: 'HK' },
+    { code: '01024', name: '快手-W', market: 'HK' },
+    { code: '02202', name: '万科企业', market: 'HK' },
+    { code: '00960', name: '龙湖集团', market: 'HK' },
+    { code: '01896', name: '微博-SW', market: 'HK' },
+    { code: '00763', name: '中兴通讯', market: 'HK' },
+    { code: '03888', name: '金山软件', market: 'HK' },
     // 指数ETF
     { code: '510300', name: '沪深300ETF', market: 'SH' },
     { code: '510500', name: '中证500ETF', market: 'SH' },
@@ -117,13 +143,7 @@ export function loadStockCodesFromCsv(csvContent: string): void {
     if (parts.length >= 2) {
       const code = parts[0].trim();
       const name = parts[1].trim();
-      let market: 'SH' | 'SZ' | 'HK' | 'US' | 'BJ' = 'SH';
-
-      // Auto-detect market from code
-      if (code.startsWith('0') || code.startsWith('3')) market = 'SZ';
-      else if (code.startsWith('6')) market = 'SH';
-      else if (code.startsWith('5') || code.startsWith('1')) market = 'SH';
-      else if (/^\d{5}$/.test(code)) market = 'HK';
+      const market = inferMarketFromCode(code) || 'SH';
 
       newStocks.push({ code, name, market });
     }
@@ -138,8 +158,60 @@ export function loadStockCodesFromCsv(csvContent: string): void {
   }
 }
 
+/**
+ * 更新所有交易记录的股票名称
+ * 根据 stockCodes 列表中的代码匹配
+ */
+export function updateAllTradeStockNames(): number {
+  const { queryAll, execute, saveDb, getChanges } = require('../database/connection');
+
+  // 获取所有交易记录中不重复的股票代码
+  const trades = queryAll(`
+    SELECT DISTINCT stock_code, market
+    FROM trades
+    WHERE market IN ('SH', 'SZ', 'BJ', 'HK')
+  `) as { stock_code: string; market: StockCode['market'] }[];
+
+  if (trades.length === 0) return 0;
+
+  let updatedCount = 0;
+
+  for (const trade of trades) {
+    const code = trade.stock_code;
+    const market = trade.market;
+    // 查找对应的股票名称
+    const stockInfo = stockCodes.find(s => s.code === code && s.market === market);
+    if (stockInfo && stockInfo.name && stockInfo.name !== code) {
+      execute(
+        `UPDATE trades
+         SET stock_name = ?
+         WHERE stock_code = ?
+           AND market = ?
+           AND (stock_name IS NULL OR stock_name <> ?)`,
+        [stockInfo.name, code, market, stockInfo.name]
+      );
+      updatedCount += Number(getChanges?.() || 0);
+    }
+  }
+
+  if (updatedCount > 0) {
+    saveDb();
+  }
+
+  return updatedCount;
+}
+
 export function registerSettingsHandlers(): void {
   initStockCodes();
+
+  // One-time normalization on startup: fix legacy stock names by code+market.
+  if (process.env.NODE_ENV !== 'test') {
+    try {
+      updateAllTradeStockNames();
+    } catch (error) {
+      console.error('Failed to normalize trade stock names on startup:', error);
+    }
+  }
 
   ipcMain.handle(IPC_CHANNELS.SETTINGS_GET, async () => {
     try {
@@ -199,6 +271,16 @@ export function registerSettingsHandlers(): void {
     }
   });
 
+  // 更新交易记录的股票名称
+  ipcMain.handle(IPC_CHANNELS.STOCK_UPDATE_NAMES, async () => {
+    try {
+      const updatedCount = updateAllTradeStockNames();
+      return { success: true, data: { updated: updatedCount } };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
   ipcMain.handle(IPC_CHANNELS.ACCOUNT_SNAPSHOT_SAVE, async (_, snapshot) => {
     try {
       const { saveSnapshot } = require('../services/account-service');
@@ -219,11 +301,28 @@ export function registerSettingsHandlers(): void {
 
   ipcMain.handle(IPC_CHANNELS.ACCOUNT_SNAPSHOT_AUTO, async () => {
     try {
-      const { generateAutoSnapshot, saveSnapshot } = require('../services/account-service');
-      const snapshotData = generateAutoSnapshot();
-      if (!snapshotData) {
-        return { success: false, error: '无法生成快照数据' };
+      const {
+        getLatestSnapshot,
+        rebuildHistoricalSnapshots,
+        generateAutoSnapshot,
+        saveSnapshot,
+      } = require('../services/account-service');
+
+      const latestBefore = getLatestSnapshot();
+      const anchorTotalAssets = latestBefore?.total_assets && latestBefore.total_assets > 0
+        ? Number(latestBefore.total_assets)
+        : undefined;
+
+      const rebuiltLatest = await rebuildHistoricalSnapshots(anchorTotalAssets);
+      if (rebuiltLatest) {
+        return { success: true, data: rebuiltLatest };
       }
+
+      const snapshotData = await generateAutoSnapshot();
+      if (!snapshotData) {
+        return { success: false, error: 'Failed to generate snapshot data' };
+      }
+
       const saved = saveSnapshot(snapshotData);
       return { success: true, data: saved };
     } catch (error: any) {

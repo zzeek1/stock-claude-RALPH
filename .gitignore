@@ -6,6 +6,7 @@ release/
 .tsbuildinfo
 .tsbuildinfo-main
 .ralph/
+.codex-convergence/
 .claude/
 *.log
 ralph-claude-code/

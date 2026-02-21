@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import type { Trade, TradeFilter, TradeListResult, Settings, StatsOverview, Position, TradingGoal, GoalProgress, GoalPeriod } from '../../shared/types';
+import type { CurrencyCode } from '../utils/currency';
+import { persistCurrencyPreference, readCurrencyPreference } from '../utils/currency';
 
 interface ThemeStore {
   isDarkMode: boolean;
@@ -163,6 +165,20 @@ export const usePositionStore = create<PositionStore>((set) => ({
     } finally {
       set({ loading: false });
     }
+  },
+}));
+
+interface CurrencyStore {
+  displayCurrency: CurrencyCode;
+  setDisplayCurrency: (currency: CurrencyCode) => void;
+}
+
+export const useCurrencyStore = create<CurrencyStore>((set) => ({
+  displayCurrency: readCurrencyPreference(),
+
+  setDisplayCurrency: (currency) => {
+    persistCurrencyPreference(currency);
+    set({ displayCurrency: currency });
   },
 }));
 
