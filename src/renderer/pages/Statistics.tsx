@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { Card, Row, Col, Statistic, Spin, Tabs, DatePicker, Select, Alert, Table, Progress, Button, message, Dropdown, Space } from 'antd';
-import type { RiskAssessment, Trade } from '../../shared/types';
+import type { CanonicalKpis, RiskAssessment, Trade } from '../../shared/types';
 import {
   ArrowUpOutlined,
   ArrowDownOutlined,
@@ -37,6 +37,7 @@ import dayjs, { Dayjs } from 'dayjs';
 import { useCurrencyStore } from '../stores';
 import { convertAmount, currencySymbol, marketCurrency } from '../utils/currency';
 import type { FxRates } from '../utils/currency';
+import { toDisplayCanonicalKpis } from '../utils/canonical-kpis';
 
 const { RangePicker } = DatePicker;
 
@@ -158,6 +159,7 @@ interface AssetCurveData {
 interface PositionBrief {
   market: string;
   floating_pnl: number;
+  current_value?: number;
 }
 
 interface CalendarHeatmapProps {
@@ -235,6 +237,145 @@ export function normalizeAssetCurveData(
   });
 }
 
+export function buildAssetCurveDisplayData(assetCurveData: AssetCurveData[]): AssetCurveData[] {
+  if (!assetCurveData.length) {
+    return [];
+  }
+
+  const alignedRows = assetCurveData.map((row) => {
+    const rawTotalAssets = Number(row.total_assets || 0);
+    const parsedCash = Number(row.cash);
+    const parsedMarketValue = Number(row.market_value);
+    const hasParts = Number.isFinite(parsedCash) && Number.isFinite(parsedMarketValue);
+
+    const cash = Number.isFinite(parsedCash) ? parsedCash : 0;
+    const marketValue = Number.isFinite(parsedMarketValue) ? parsedMarketValue : 0;
+    const totalAssetsFromParts = hasParts ? cash + marketValue : rawTotalAssets;
+    const totalAssets = Number.isFinite(totalAssetsFromParts) ? totalAssetsFromParts : rawTotalAssets;
+
+    return {
+      ...row,
+      total_assets: Number.isFinite(totalAssets) ? totalAssets : 0,
+      cash,
+      market_value: marketValue,
+    };
+  });
+
+  const baseAssets = Number(alignedRows[0].total_assets || 0);
+  let previousAssets = baseAssets;
+  return alignedRows.map((row, index) => {
+    const totalAssets = Number(row.total_assets || 0);
+    const dailyPnl = index === 0 ? 0 : totalAssets - previousAssets;
+    const dailyReturn = index === 0 || previousAssets === 0 ? 0 : dailyPnl / previousAssets;
+    const cumulativeReturn = baseAssets > 0 ? (totalAssets - baseAssets) / baseAssets : 0;
+
+    previousAssets = totalAssets;
+    return {
+      ...row,
+      daily_pnl: dailyPnl,
+      daily_return: dailyReturn,
+      cumulative_return: cumulativeReturn,
+    };
+  });
+}
+
+export function alignLatestAssetCurveWithLiveMarketValue(
+  assetCurveData: AssetCurveData[],
+  liveMarketValue: number,
+  shouldAlign: boolean,
+): AssetCurveData[] {
+  if (!shouldAlign || assetCurveData.length === 0 || !Number.isFinite(liveMarketValue)) {
+    return assetCurveData;
+  }
+
+  const lastIndex = assetCurveData.length - 1;
+  const lastRow = assetCurveData[lastIndex];
+  const cash = Number(lastRow.cash || 0);
+  const nextTotalAssets = Number.isFinite(cash)
+    ? cash + liveMarketValue
+    : Number(lastRow.total_assets || 0);
+
+  const nextRows = [...assetCurveData];
+  nextRows[lastIndex] = {
+    ...lastRow,
+    market_value: liveMarketValue,
+    total_assets: Number.isFinite(nextTotalAssets) ? nextTotalAssets : 0,
+  };
+  return nextRows;
+}
+
+function buildDrawdownFromAssetCurve(assetCurveData: AssetCurveData[]): DrawdownData[] {
+  if (!assetCurveData.length) {
+    return [];
+  }
+
+  let peak = 0;
+  return assetCurveData.map((point) => {
+    const value = Number(point.total_assets || 0);
+    peak = Math.max(peak, value);
+    const drawdown = peak > 0 ? (peak - value) / peak : 0;
+    return {
+      date: point.date,
+      drawdown,
+      peak,
+      value,
+    };
+  });
+}
+
+function alignDrawdownSeriesToCanonicalMax(
+  series: DrawdownData[],
+  canonicalMaxDrawdown?: number,
+): DrawdownData[] {
+  if (!series.length) {
+    return [];
+  }
+
+  const targetMax = Number(canonicalMaxDrawdown);
+  if (!Number.isFinite(targetMax) || targetMax < 0) {
+    return series;
+  }
+
+  const currentMax = series.reduce((max, point) => Math.max(max, Number(point.drawdown || 0)), 0);
+  if (currentMax > 0) {
+    const scale = targetMax / currentMax;
+    return series.map((point) => ({
+      ...point,
+      drawdown: Number(point.drawdown || 0) * scale,
+    }));
+  }
+
+  if (targetMax === 0) {
+    return series;
+  }
+
+  const last = series[series.length - 1];
+  return [
+    ...series.slice(0, -1),
+    {
+      ...last,
+      drawdown: targetMax,
+    },
+  ];
+}
+
+export function buildDisplayDrawdownData(
+  normalizedAssetCurve: AssetCurveData[],
+  fallbackDrawdownData: DrawdownData[],
+  canonicalMaxDrawdown?: number,
+): DrawdownData[] {
+  const baseSeries = fallbackDrawdownData.length > 0
+    ? fallbackDrawdownData.map((point) => ({ ...point, drawdown: Math.abs(Number(point.drawdown || 0)) }))
+    : buildDrawdownFromAssetCurve(normalizedAssetCurve);
+
+  return alignDrawdownSeriesToCanonicalMax(baseSeries, canonicalMaxDrawdown);
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 async function fetchAllSellTrades(startDate?: string, endDate?: string): Promise<Trade[]> {
   const all: Trade[] = [];
   let page = 1;
@@ -260,9 +401,14 @@ async function fetchAllSellTrades(startDate?: string, endDate?: string): Promise
     total = result.data.total || chunk.length;
 
     for (const trade of chunk) {
-      if (typeof trade.realized_pnl === 'number') {
-        all.push(trade);
+      const normalizedRealizedPnl = toFiniteNumber(trade.realized_pnl);
+      if (normalizedRealizedPnl === null) {
+        continue;
       }
+      all.push({
+        ...trade,
+        realized_pnl: normalizedRealizedPnl,
+      });
     }
 
     if (chunk.length === 0) {
@@ -488,6 +634,8 @@ const Statistics: React.FC = () => {
   const [fxRates, setFxRates] = useState<FxRates | undefined>(undefined);
   const [initialCapital, setInitialCapital] = useState(0);
   const [riskAssessment, setRiskAssessment] = useState<RiskAssessment | null>(null);
+  const [canonicalKpis, setCanonicalKpis] = useState<CanonicalKpis | null>(null);
+  const [canonicalKpiFallbackReason, setCanonicalKpiFallbackReason] = useState<string | null>(null);
   const [strategyTrendData, setStrategyTrendData] = useState<StrategyTrendData[]>([]);
   const [strategyWinRateTrend, setStrategyWinRateTrend] = useState<StrategyWinRateTrend[]>([]);
 
@@ -527,6 +675,7 @@ const Statistics: React.FC = () => {
         strategyTrendRes,
         strategyWinRateTrendRes,
         emotionHeatmapRes,
+        canonicalKpisRes,
         settingsRes,
         allSells,
       ] = await Promise.all([
@@ -545,6 +694,7 @@ const Statistics: React.FC = () => {
         window.electronAPI.stats.strategyTrend(startDate, endDate),
         window.electronAPI.stats.strategyWinRateTrend(startDate, endDate),
         window.electronAPI.stats.emotionHeatmap(startDate, endDate),
+        window.electronAPI.stats.canonicalKpis(startDate, endDate),
         window.electronAPI.settings.get(),
         fetchAllSellTrades(startDate, endDate),
       ]);
@@ -564,12 +714,20 @@ const Statistics: React.FC = () => {
       if (strategyTrendRes.success) setStrategyTrendData(strategyTrendRes.data ?? []);
       if (strategyWinRateTrendRes.success) setStrategyWinRateTrend(strategyWinRateTrendRes.data ?? []);
       if (emotionHeatmapRes.success) setEmotionHeatmapData(emotionHeatmapRes.data ?? []);
+      if (canonicalKpisRes.success && canonicalKpisRes.data) {
+        setCanonicalKpis(canonicalKpisRes.data as CanonicalKpis);
+        setCanonicalKpiFallbackReason(null);
+      } else {
+        setCanonicalKpis(null);
+        setCanonicalKpiFallbackReason(canonicalKpisRes.error ?? 'canonical-kpi-unavailable');
+      }
       if (settingsRes.success && settingsRes.data) {
         setInitialCapital(Number(settingsRes.data.initial_capital || 0));
       }
       setSellTrades(allSells);
     } catch (error) {
       console.error('Failed to fetch statistics data:', error);
+      setCanonicalKpiFallbackReason(error instanceof Error ? error.message : String(error));
     } finally {
       setLoading(false);
     }
@@ -615,6 +773,9 @@ const Statistics: React.FC = () => {
   };
 
   const displaySymbol = currencySymbol(displayCurrency);
+  const canonicalKpisDisplay = useMemo(() => {
+    return toDisplayCanonicalKpis(canonicalKpis, displayCurrency, fxRates);
+  }, [canonicalKpis, displayCurrency, fxRates]);
 
   const convertedTradeMetrics = useMemo(() => {
     if (sellTrades.length === 0) {
@@ -622,6 +783,7 @@ const Statistics: React.FC = () => {
     }
 
     let realizedPnl = 0;
+    let realizedCostBasis = 0;
     let winCount = 0;
     let lossCount = 0;
     let flatCount = 0;
@@ -630,9 +792,21 @@ const Statistics: React.FC = () => {
 
     for (const trade of sellTrades) {
       const fromCurrency = marketCurrency(trade.market);
-      const rawPnl = Number(trade.realized_pnl || 0);
+      const rawPnl = toFiniteNumber(trade.realized_pnl) ?? 0;
       const convertedPnl = convertAmount(rawPnl, fromCurrency, displayCurrency, fxRates);
       realizedPnl += convertedPnl;
+
+      const totalCost = toFiniteNumber(trade.total_cost);
+      const amount = toFiniteNumber(trade.amount);
+      const commission = toFiniteNumber(trade.commission) ?? 0;
+      const stampTax = toFiniteNumber(trade.stamp_tax) ?? 0;
+      const sellRevenue = totalCost ?? (amount !== null ? amount - commission - stampTax : null);
+      if (sellRevenue !== null) {
+        const buyCost = sellRevenue - rawPnl;
+        if (buyCost > 0) {
+          realizedCostBasis += convertAmount(buyCost, fromCurrency, displayCurrency, fxRates);
+        }
+      }
 
       if (convertedPnl > 0) {
         winCount += 1;
@@ -651,9 +825,12 @@ const Statistics: React.FC = () => {
     const avgLoss = lossCount > 0 ? lossPnlSum / lossCount : 0;
     const profitLossRatio = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
     const expectancy = winRate * avgWin + (1 - winRate) * avgLoss;
+    const realizedReturn = realizedCostBasis > 0 ? realizedPnl / realizedCostBasis : 0;
 
     return {
       realizedPnl,
+      realizedCostBasis,
+      realizedReturn,
       totalTrades,
       winRate,
       avgWin,
@@ -675,11 +852,34 @@ const Statistics: React.FC = () => {
     }, 0);
   }, [positions, displayCurrency, fxRates]);
 
+  const liveMarketValueDisplay = useMemo(() => {
+    return positions.reduce((sum, p) => {
+      const converted = convertAmount(
+        Number(p.current_value || 0),
+        marketCurrency(p.market),
+        displayCurrency,
+        fxRates,
+      );
+      return sum + converted;
+    }, 0);
+  }, [positions, displayCurrency, fxRates]);
+
+  const shouldAlignLatestAssetPointWithLiveValue = useMemo(() => {
+    if (!dateRange) {
+      return true;
+    }
+    return dateRange[1].format('YYYY-MM-DD') >= dayjs().format('YYYY-MM-DD');
+  }, [dateRange]);
+
+  const hasLiveMarketValueData = useMemo(() => {
+    return positions.some((p) => Number.isFinite(Number(p.current_value)));
+  }, [positions]);
+
   const convertedAssetCurve = useMemo<AssetCurveData[]>(() => {
     if (!assetCurve.length) return [];
 
     let lastValidTotalAssets = 0;
-    return assetCurve.map((row) => {
+    const convertedRows = assetCurve.map((row) => {
       const convertedTotalAssets = convertAmount(Number(row.total_assets || 0), 'CNY', displayCurrency, fxRates);
       const convertedCash = convertAmount(Number(row.cash || 0), 'CNY', displayCurrency, fxRates);
       const convertedMarketValue = convertAmount(Number(row.market_value || 0), 'CNY', displayCurrency, fxRates);
@@ -705,7 +905,20 @@ const Statistics: React.FC = () => {
         daily_pnl: convertedDailyPnl,
       };
     });
-  }, [assetCurve, displayCurrency, fxRates]);
+
+    return alignLatestAssetCurveWithLiveMarketValue(
+      convertedRows,
+      liveMarketValueDisplay,
+      shouldAlignLatestAssetPointWithLiveValue && hasLiveMarketValueData,
+    );
+  }, [
+    assetCurve,
+    displayCurrency,
+    fxRates,
+    liveMarketValueDisplay,
+    shouldAlignLatestAssetPointWithLiveValue,
+    hasLiveMarketValueData,
+  ]);
 
   const convertedPnlCurve = useMemo<PnlDataPoint[]>(() => {
     if (convertedTradeMetrics && sellTrades.length > 0) {
@@ -757,19 +970,20 @@ const Statistics: React.FC = () => {
   }, [convertedAssetCurve, fallbackAssetCurve]);
 
   const realizedPnl =
-    convertedTradeMetrics?.realizedPnl ??
-    convertAmount(Number(overview?.total_pnl ?? 0), 'CNY', displayCurrency, fxRates);
-  const unrealizedPnl = floatingPnlDisplay;
-  const totalPnl = realizedPnl + unrealizedPnl;
-  const totalTrades = convertedTradeMetrics?.totalTrades ?? (overview?.total_trades ?? 0);
-  const winRate = convertedTradeMetrics?.winRate ?? (overview?.win_rate ?? 0);
-  const profitLossRatio = convertedTradeMetrics?.profitLossRatio ?? (overview?.profit_loss_ratio ?? 0);
+    canonicalKpisDisplay?.realized_pnl
+    ?? convertedTradeMetrics?.realizedPnl
+    ?? convertAmount(Number(overview?.total_pnl ?? 0), 'CNY', displayCurrency, fxRates);
+  const unrealizedPnl = canonicalKpisDisplay?.unrealized_pnl ?? floatingPnlDisplay;
+  const totalPnl = canonicalKpisDisplay?.total_pnl ?? (realizedPnl + unrealizedPnl);
+  const totalTrades = canonicalKpisDisplay?.total_trades ?? (overview?.total_trades ?? 0);
+  const winRate = canonicalKpisDisplay?.win_rate ?? (overview?.win_rate ?? 0);
+  const profitLossRatio = canonicalKpisDisplay?.profit_loss_ratio ?? (overview?.profit_loss_ratio ?? 0);
   const avgHoldingDays = overview?.avg_holding_days ?? 0;
   const maxConsecutiveWins = overview?.max_consecutive_wins ?? 0;
   const maxConsecutiveLosses = overview?.max_consecutive_losses ?? 0;
   const expectancy =
-    convertedTradeMetrics?.expectancy ??
-    convertAmount(Number(overview?.expectancy ?? 0), 'CNY', displayCurrency, fxRates);
+    canonicalKpisDisplay?.expectancy
+    ?? convertAmount(Number(overview?.expectancy ?? 0), 'CNY', displayCurrency, fxRates);
   const impulsiveTradeCount = overview?.impulsive_trade_count ?? 0;
   const stopLossRate = overview?.stop_loss_execution_rate ?? 0;
 
@@ -785,36 +999,66 @@ const Statistics: React.FC = () => {
 
   const baselineAssetsForReturn = totalAssets - totalPnl;
   const totalReturn = baselineAssetsForReturn > 0 ? totalPnl / baselineAssetsForReturn : 0;
+  const headlinePnl = totalPnl;
+  const headlineReturn = canonicalKpisDisplay?.total_return ?? totalReturn;
 
   const normalizedAssetCurve = useMemo<AssetCurveData[]>(() => {
     if (!displayAssetCurve.length) {
       return [];
     }
-    return normalizeAssetCurveData(displayAssetCurve, baselineAssetsForReturn, totalAssets);
-  }, [displayAssetCurve, baselineAssetsForReturn, totalAssets]);
+    return buildAssetCurveDisplayData(displayAssetCurve);
+  }, [displayAssetCurve]);
 
+  const canonicalMaxDrawdown = canonicalKpisDisplay?.max_drawdown;
   const displayDrawdownData = useMemo<DrawdownData[]>(() => {
-    if (!normalizedAssetCurve.length) {
-      return drawdownData.map((point) => ({ ...point, drawdown: Math.abs(Number(point.drawdown || 0)) }));
+    return buildDisplayDrawdownData(normalizedAssetCurve, drawdownData, canonicalMaxDrawdown);
+  }, [normalizedAssetCurve, drawdownData, canonicalMaxDrawdown]);
+
+  const maxDrawdown = canonicalKpisDisplay?.max_drawdown
+    ?? (displayDrawdownData.length > 0
+      ? displayDrawdownData.reduce((max, point) => Math.max(max, Number(point.drawdown || 0)), 0)
+      : (overview?.max_drawdown ?? 0));
+
+  const riskAssessmentDisplay = useMemo<RiskAssessment | null>(() => {
+    if (!riskAssessment) {
+      return null;
     }
 
-    let peak = 0;
-    return normalizedAssetCurve.map((point) => {
-      const value = Number(point.total_assets || 0);
-      peak = Math.max(peak, value);
-      const drawdown = peak > 0 ? (peak - value) / peak : 0;
-      return {
-        date: point.date,
-        drawdown,
-        peak,
-        value,
-      };
-    });
-  }, [normalizedAssetCurve, drawdownData]);
+    const convertFromCny = (value: number) => convertAmount(
+      Number(value || 0),
+      'CNY',
+      displayCurrency,
+      fxRates,
+    );
 
-  const maxDrawdown = displayDrawdownData.length > 0
-    ? displayDrawdownData.reduce((max, point) => Math.max(max, Number(point.drawdown || 0)), 0)
-    : (overview?.max_drawdown ?? 0);
+    return {
+      ...riskAssessment,
+      exposure: {
+        ...riskAssessment.exposure,
+        total_market_value: convertFromCny(riskAssessment.exposure.total_market_value),
+        market_exposure: riskAssessment.exposure.market_exposure.map((item) => ({
+          ...item,
+          value: convertFromCny(item.value),
+        })),
+        stock_exposure: riskAssessment.exposure.stock_exposure.map((item) => ({
+          ...item,
+          value: convertFromCny(item.value),
+        })),
+      },
+      risk_reward: {
+        ...riskAssessment.risk_reward,
+        potential_upside: convertFromCny(riskAssessment.risk_reward.potential_upside),
+        potential_downside: convertFromCny(riskAssessment.risk_reward.potential_downside),
+      },
+      max_potential_loss: {
+        ...riskAssessment.max_potential_loss,
+        if_all_stop_loss: convertFromCny(riskAssessment.max_potential_loss.if_all_stop_loss),
+        largest_single_loss: convertFromCny(riskAssessment.max_potential_loss.largest_single_loss),
+        loss_from_concentration: convertFromCny(riskAssessment.max_potential_loss.loss_from_concentration),
+        cash_available: convertFromCny(riskAssessment.max_potential_loss.cash_available),
+      },
+    };
+  }, [riskAssessment, displayCurrency, fxRates]);
   
   const planTotal = planStats?.total_with_plan ?? 0;
   const planExecuted = planStats?.executed_count ?? 0;
@@ -1194,7 +1438,7 @@ const Statistics: React.FC = () => {
     {
       key: 'riskAssessment',
       label: '风险评估',
-      children: riskAssessment ? (
+      children: riskAssessmentDisplay ? (
         <div>
           <Alert
             message={
@@ -1204,25 +1448,25 @@ const Statistics: React.FC = () => {
                   style={{
                     fontWeight: 'bold',
                     color:
-                      riskAssessment.overall_risk_level === 'high'
+                      riskAssessmentDisplay.overall_risk_level === 'high'
                         ? '#ff4d4f'
-                        : riskAssessment.overall_risk_level === 'medium'
+                        : riskAssessmentDisplay.overall_risk_level === 'medium'
                           ? '#faad14'
                           : '#52c41a',
                   }}
                 >
-                  {riskAssessment.overall_risk_level === 'high'
+                  {riskAssessmentDisplay.overall_risk_level === 'high'
                     ? '高风险'
-                    : riskAssessment.overall_risk_level === 'medium'
+                    : riskAssessmentDisplay.overall_risk_level === 'medium'
                       ? '中等风险'
                       : '低风险'}
                 </span>
               </span>
             }
             type={
-              riskAssessment.overall_risk_level === 'high'
+              riskAssessmentDisplay.overall_risk_level === 'high'
                 ? 'error'
-                : riskAssessment.overall_risk_level === 'medium'
+                : riskAssessmentDisplay.overall_risk_level === 'medium'
                   ? 'warning'
                   : 'success'
             }
@@ -1231,12 +1475,12 @@ const Statistics: React.FC = () => {
             style={{ marginBottom: 16 }}
           />
 
-          {riskAssessment.risk_warnings.length > 0 && (
+          {riskAssessmentDisplay.risk_warnings.length > 0 && (
             <Alert
               message="风险提示"
               description={
                 <ul style={{ margin: 0, paddingLeft: 20 }}>
-                  {riskAssessment.risk_warnings.map((w, i) => (
+                  {riskAssessmentDisplay.risk_warnings.map((w, i) => (
                     <li key={i}>{w}</li>
                   ))}
                 </ul>
@@ -1252,19 +1496,19 @@ const Statistics: React.FC = () => {
               <Card title="风险敞口" size="small">
                 <Statistic
                   title="总市值"
-                  value={riskAssessment.exposure.total_market_value}
+                  value={riskAssessmentDisplay.exposure.total_market_value}
                   precision={0}
                   suffix={displaySymbol}
                 />
                 <Statistic
                   title="总敞口占比"
-                  value={riskAssessment.exposure.total_exposure * 100}
+                  value={riskAssessmentDisplay.exposure.total_exposure * 100}
                   precision={1}
                   suffix="%"
                 />
                 <Statistic
                   title="最大单一仓位"
-                  value={riskAssessment.exposure.largest_position_pct * 100}
+                  value={riskAssessmentDisplay.exposure.largest_position_pct * 100}
                   precision={1}
                   suffix="%"
                 />
@@ -1274,22 +1518,22 @@ const Statistics: React.FC = () => {
               <Card title="风险收益比" size="small">
                 <Statistic
                   title="当前风险收益比"
-                  value={riskAssessment.risk_reward.current_risk_reward}
+                  value={riskAssessmentDisplay.risk_reward.current_risk_reward}
                   precision={2}
                 />
                 <Statistic
                   title="已设止损仓位数"
-                  value={riskAssessment.risk_reward.positions_with_sl}
+                  value={riskAssessmentDisplay.risk_reward.positions_with_sl}
                 />
                 <Statistic
                   title="潜在上行空间"
-                  value={riskAssessment.risk_reward.potential_upside}
+                  value={riskAssessmentDisplay.risk_reward.potential_upside}
                   precision={0}
                   suffix={displaySymbol}
                 />
                 <Statistic
                   title="潜在下行风险"
-                  value={riskAssessment.risk_reward.potential_downside}
+                  value={riskAssessmentDisplay.risk_reward.potential_downside}
                   precision={0}
                   suffix={displaySymbol}
                   valueStyle={{ color: '#ff4d4f' }}
@@ -1298,10 +1542,10 @@ const Statistics: React.FC = () => {
             </Col>
           </Row>
 
-          {riskAssessment.exposure.stock_exposure.length > 0 && (
+          {riskAssessmentDisplay.exposure.stock_exposure.length > 0 && (
             <Card title="股票敞口 (Top 10)" size="small" style={{ marginTop: 16 }}>
               <Table
-                dataSource={riskAssessment.exposure.stock_exposure}
+                dataSource={riskAssessmentDisplay.exposure.stock_exposure}
                 rowKey="stock_code"
                 size="small"
                 pagination={false}
@@ -1362,16 +1606,25 @@ const Statistics: React.FC = () => {
         </div>
       ) : (
         <>
+          {canonicalKpiFallbackReason && (
+            <Alert
+              type="warning"
+              showIcon
+              message="共享KPI降级模式"
+              description={`原因：${canonicalKpiFallbackReason}。回退口径：总盈亏=已实现+未实现，金额按当前显示币种换算，最大回撤与图表序列保持同源。`}
+              style={{ marginBottom: 16 }}
+            />
+          )}
           {/* Stats Overview Cards */}
           <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
             <Col xs={24} sm={12} md={8} lg={6} xl={4}>
               <Card variant="borderless" hoverable size="small">
                 <Statistic
                   title="总盈亏"
-                  value={totalPnl}
+                  value={headlinePnl}
                   precision={0}
-                  valueStyle={{ color: totalPnl >= 0 ? '#52c41a' : '#ff4d4f', fontSize: 18 }}
-                  prefix={totalPnl >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
+                  valueStyle={{ color: headlinePnl >= 0 ? '#52c41a' : '#ff4d4f', fontSize: 18 }}
+                  prefix={headlinePnl >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
                   suffix={displaySymbol}
                 />
               </Card>
@@ -1379,10 +1632,10 @@ const Statistics: React.FC = () => {
             <Col xs={24} sm={12} md={8} lg={6} xl={4}>
               <Card variant="borderless" hoverable size="small">
                 <Statistic
-                  title="总收益率"
-                  value={(totalReturn * 100).toFixed(1) + '%'}
-                  valueStyle={{ color: totalReturn >= 0 ? '#52c41a' : '#ff4d4f', fontSize: 18 }}
-                  prefix={totalReturn >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
+                  title="收益率"
+                  value={(headlineReturn * 100).toFixed(1) + '%'}
+                  valueStyle={{ color: headlineReturn >= 0 ? '#52c41a' : '#ff4d4f', fontSize: 18 }}
+                  prefix={headlineReturn >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
                 />
               </Card>
             </Col>

@@ -3,10 +3,24 @@ import {
   StatsOverview, PnlDataPoint, StrategyStats, EmotionWinRate,
   MonthlyStats, CalendarHeatmapData, DrawdownData, PnlDistribution,
   Position, PlanExecutionStats, PlanExecutionDetail,
+  CanonicalKpis,
   RiskAssessment, RiskExposure, RiskReward, MaxPotentialLoss, Market,
   StrategyTrendData, StrategyWinRateTrend, EmotionHeatmapData,
 } from '../../shared/types';
-import { getQuotes } from './quote-service';
+import { getQuotes, getFxRates } from './quote-service';
+import { calculateConsecutiveStats } from './streak-utils';
+
+type FxRates = {
+  USD: number;
+  HKD: number;
+  CNY: number;
+};
+
+const DEFAULT_FX_RATES: FxRates = {
+  USD: 1,
+  HKD: 7.8,
+  CNY: 7.2,
+};
 
 export function getStatsOverview(startDate?: string, endDate?: string): StatsOverview {
   const dateFilter = buildDateFilter(startDate, endDate);
@@ -48,22 +62,12 @@ export function getStatsOverview(startDate?: string, endDate?: string): StatsOve
   const sellTrades = queryAll(`
     SELECT realized_pnl FROM trades
     WHERE direction = 'SELL' AND realized_pnl IS NOT NULL ${dateFilter.clause}
-    ORDER BY trade_date ASC
+    ORDER BY trade_date ASC, created_at ASC, id ASC
   `, dateFilter.params);
 
-  let maxConsecutiveWins = 0, maxConsecutiveLosses = 0;
-  let currentWins = 0, currentLosses = 0;
-  for (const t of sellTrades) {
-    if (t.realized_pnl > 0) {
-      currentWins++;
-      currentLosses = 0;
-      maxConsecutiveWins = Math.max(maxConsecutiveWins, currentWins);
-    } else {
-      currentLosses++;
-      currentWins = 0;
-      maxConsecutiveLosses = Math.max(maxConsecutiveLosses, currentLosses);
-    }
-  }
+  const streakStats = calculateConsecutiveStats(
+    sellTrades.map((t: { realized_pnl: number }) => Number(t.realized_pnl) || 0),
+  );
 
   const maxDrawdown = calculateMaxDrawdown(startDate, endDate);
 
@@ -83,8 +87,10 @@ export function getStatsOverview(startDate?: string, endDate?: string): StatsOve
     winning_trades: sellStats.winning,
     losing_trades: sellStats.losing,
     max_drawdown: maxDrawdown,
-    max_consecutive_wins: maxConsecutiveWins,
-    max_consecutive_losses: maxConsecutiveLosses,
+    max_consecutive_wins: streakStats.maxConsecutiveWins,
+    max_consecutive_losses: streakStats.maxConsecutiveLosses,
+    current_consecutive_wins: streakStats.currentConsecutiveWins,
+    current_consecutive_losses: streakStats.currentConsecutiveLosses,
     avg_holding_days: sellStats.avg_holding_days,
     impulsive_trade_count: impulsiveStats?.total ?? 0,
     impulsive_trade_win_rate: impulsiveStats?.total > 0 ? impulsiveStats.winning / impulsiveStats.total : 0,
@@ -92,6 +98,157 @@ export function getStatsOverview(startDate?: string, endDate?: string): StatsOve
     expectancy,
     avg_win: sellStats.avg_win,
     avg_loss: sellStats.avg_loss,
+  };
+}
+
+function convertMarketAmountToCny(amount: number, market: string, fxRates: FxRates): number {
+  if (!Number.isFinite(amount)) return 0;
+  if (market === 'US') return amount * (fxRates.CNY / fxRates.USD);
+  if (market === 'HK') return amount * (fxRates.CNY / fxRates.HKD);
+  return amount;
+}
+
+async function getFxRatesWithFallback(): Promise<FxRates> {
+  try {
+    const fxRates = await getFxRates();
+    if (fxRates.USD > 0 && fxRates.HKD > 0 && fxRates.CNY > 0) {
+      return fxRates;
+    }
+  } catch {
+    // fallback to defaults
+  }
+  return DEFAULT_FX_RATES;
+}
+
+export async function getCanonicalKpis(startDate?: string, endDate?: string): Promise<CanonicalKpis> {
+  const dateFilter = buildDateFilter(startDate, endDate);
+  const fxRates = await getFxRatesWithFallback();
+
+  const sellTrades = queryAll(
+    `
+      SELECT realized_pnl, market
+      FROM trades
+      WHERE direction = 'SELL' AND realized_pnl IS NOT NULL ${dateFilter.clause}
+    `,
+    dateFilter.params,
+  ) as Array<{ realized_pnl: number; market: Market }>;
+
+  let realizedPnl = 0;
+  let winCount = 0;
+  let lossCount = 0;
+  let flatCount = 0;
+  let winPnlSum = 0;
+  let lossPnlSum = 0;
+
+  for (const trade of sellTrades) {
+    const rawPnl = Number(trade.realized_pnl);
+    if (!Number.isFinite(rawPnl)) continue;
+
+    const normalized = convertMarketAmountToCny(rawPnl, trade.market, fxRates);
+    realizedPnl += normalized;
+
+    if (normalized > 0) {
+      winCount += 1;
+      winPnlSum += normalized;
+    } else if (normalized < 0) {
+      lossCount += 1;
+      lossPnlSum += normalized;
+    } else {
+      flatCount += 1;
+    }
+  }
+
+  const isHistoricalSnapshot = isHistoricalRangeEnd(endDate);
+  const positions = isHistoricalSnapshot ? [] : await getPositions();
+  const unrealizedPnl = isHistoricalSnapshot
+    ? 0
+    : positions.reduce((sum, position) => {
+      const marketPnl = Number(position.floating_pnl || 0);
+      return sum + convertMarketAmountToCny(marketPnl, position.market, fxRates);
+    }, 0);
+
+  const totalTradesRow = queryOne(
+    `SELECT COUNT(*) as total FROM trades WHERE 1=1 ${dateFilter.clause}`,
+    dateFilter.params,
+  ) as { total?: number } | null;
+
+  const sellCount = winCount + lossCount + flatCount;
+  const winRate = sellCount > 0 ? winCount / sellCount : 0;
+  const avgWin = winCount > 0 ? winPnlSum / winCount : 0;
+  const avgLoss = lossCount > 0 ? lossPnlSum / lossCount : 0;
+  const profitLossRatio = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
+  const expectancy = winRate * avgWin + (1 - winRate) * avgLoss;
+  const totalPnl = realizedPnl + unrealizedPnl;
+
+  const snapshotConditions: string[] = [];
+  const snapshotParams: any[] = [];
+  if (startDate) {
+    snapshotConditions.push('AND date >= ?');
+    snapshotParams.push(startDate);
+  }
+  if (endDate) {
+    snapshotConditions.push('AND date <= ?');
+    snapshotParams.push(endDate);
+  }
+  const assetSnapshots = queryAll(
+    `
+      SELECT date, COALESCE(total_assets, 0) as total_assets
+      FROM account_snapshots
+      WHERE 1=1 ${snapshotConditions.join(' ')}
+      ORDER BY date ASC
+    `,
+    snapshotParams,
+  ) as Array<{ date: string; total_assets: number }>;
+
+  let latestSnapshotAssets = 0;
+  for (const row of assetSnapshots) {
+    const value = Number(row.total_assets || 0);
+    if (value > 0) {
+      latestSnapshotAssets = value;
+    }
+  }
+
+  const initialCapital = getInitialCapital();
+  const totalAssets = latestSnapshotAssets > 0
+    ? latestSnapshotAssets
+    : Math.max(0, initialCapital + totalPnl);
+  const baselineAssetsForReturn = totalAssets - totalPnl;
+  const totalReturn = baselineAssetsForReturn > 0 ? totalPnl / baselineAssetsForReturn : 0;
+
+  let maxDrawdown = 0;
+  if (assetSnapshots.length > 0) {
+    let peak = 0;
+    for (const row of assetSnapshots) {
+      const value = Number(row.total_assets || 0);
+      if (value <= 0) continue;
+      peak = Math.max(peak, value);
+      const drawdown = peak > 0 ? (peak - value) / peak : 0;
+      maxDrawdown = Math.max(maxDrawdown, drawdown);
+    }
+    if (maxDrawdown === 0 && !assetSnapshots.some((row) => Number(row.total_assets || 0) > 0)) {
+      maxDrawdown = calculateMaxDrawdown(startDate, endDate);
+    }
+  } else {
+    maxDrawdown = calculateMaxDrawdown(startDate, endDate);
+  }
+
+  return {
+    base_currency: 'CNY',
+    realized_pnl: realizedPnl,
+    unrealized_pnl: unrealizedPnl,
+    total_pnl: totalPnl,
+    total_assets: totalAssets,
+    total_return: totalReturn,
+    max_drawdown: maxDrawdown,
+    total_trades: totalTradesRow?.total ?? 0,
+    winning_trades: winCount,
+    losing_trades: lossCount,
+    flat_trades: flatCount,
+    win_rate: winRate,
+    avg_win: avgWin,
+    avg_loss: avgLoss,
+    profit_loss_ratio: profitLossRatio,
+    expectancy,
   };
 }
 
@@ -183,6 +340,8 @@ export function getCalendarData(year: number): CalendarHeatmapData[] {
       COUNT(*) as trade_count
     FROM trades
     WHERE trade_date >= ? AND trade_date <= ?
+      AND direction = 'SELL'
+      AND realized_pnl IS NOT NULL
     GROUP BY trade_date
     ORDER BY trade_date ASC
   `, [startDate, endDate]) as CalendarHeatmapData[];
@@ -236,76 +395,226 @@ export function getPnlDistribution(startDate?: string, endDate?: string): PnlDis
 }
 
 export async function getPositions(): Promise<Position[]> {
-  const positions = queryAll(`
+  type TradeRow = {
+    stock_code: string;
+    stock_name: string;
+    market: Market;
+    direction: 'BUY' | 'SELL';
+    trade_date: string;
+    quantity: number;
+    total_cost: number;
+    stop_loss?: number | null;
+    take_profit?: number | null;
+  };
+
+  type PositionState = {
+    stock_code: string;
+    stock_name: string;
+    market: Market;
+    quantity: number;
+    total_cost: number;
+    first_buy_date: string;
+    last_trade_date: string;
+    short_qty: number;
+    lots: Array<{ qty: number; cost_per_share: number; trade_date: string }>;
+    stop_loss?: number;
+    take_profit?: number;
+  };
+
+  const trades = queryAll(`
     SELECT
-      t.stock_code,
-      t.stock_name,
-      t.market,
-      SUM(CASE WHEN t.direction = 'BUY' THEN t.quantity ELSE -t.quantity END) as quantity,
-      CASE WHEN SUM(CASE WHEN t.direction = 'BUY' THEN t.quantity ELSE 0 END) > 0
-        THEN SUM(CASE WHEN t.direction = 'BUY' THEN t.total_cost ELSE 0 END) / SUM(CASE WHEN t.direction = 'BUY' THEN t.quantity ELSE 0 END)
-        ELSE 0 END as avg_cost,
-      SUM(CASE WHEN t.direction = 'BUY' THEN t.total_cost ELSE 0 END) as total_cost,
-      MIN(CASE WHEN t.direction = 'BUY' THEN t.trade_date END) as first_buy_date,
-      MAX(t.trade_date) as last_trade_date,
-      CAST(julianday('now') - julianday(MIN(CASE WHEN t.direction = 'BUY' THEN t.trade_date END)) AS INTEGER) as holding_days,
-      -- 获取最近一次买入的止损和止盈价格
-      (SELECT stop_loss FROM trades WHERE stock_code = t.stock_code AND direction = 'BUY' AND stop_loss IS NOT NULL ORDER BY trade_date DESC, created_at DESC LIMIT 1) as stop_loss,
-      (SELECT take_profit FROM trades WHERE stock_code = t.stock_code AND direction = 'BUY' AND take_profit IS NOT NULL ORDER BY trade_date DESC, created_at DESC LIMIT 1) as take_profit
-    FROM trades t
-    GROUP BY t.stock_code
-    HAVING SUM(CASE WHEN t.direction = 'BUY' THEN t.quantity ELSE -t.quantity END) > 0
-    ORDER BY t.stock_code
-  `) as Position[];
+      stock_code,
+      stock_name,
+      market,
+      direction,
+      trade_date,
+      quantity,
+      total_cost,
+      stop_loss,
+      take_profit
+    FROM trades
+    ORDER BY stock_code ASC, trade_date ASC, created_at ASC
+  `) as TradeRow[];
 
-  if (positions.length === 0) return positions;
+  if (trades.length === 0) return [];
 
-  // 获取实时股价
-  const symbolMap: Record<string, { code: string; market: string }> = {};
-  const symbols: string[] = [];
+  const states = new Map<string, PositionState>();
 
-  for (const pos of positions) {
-    let symbol = pos.stock_code;
-    if (pos.market === 'SH') symbol = pos.stock_code + '.SH';
-    else if (pos.market === 'SZ') symbol = pos.stock_code + '.SZ';
-    else if (pos.market === 'HK') symbol = pos.stock_code + '.HK';
-    else if (pos.market === 'US') symbol = pos.stock_code + '.US';
+  for (const trade of trades) {
+    const normalizedCode = (trade.stock_code || '').trim().toUpperCase();
+    const key = `${normalizedCode}::${trade.market}`;
+    const qty = Math.max(0, Number(trade.quantity) || 0);
+    const cost = Number(trade.total_cost) || 0;
+    const direction = String(trade.direction || '').trim().toUpperCase();
 
-    symbolMap[symbol] = { code: pos.stock_code, market: pos.market };
-    symbols.push(symbol);
+    const state = states.get(key) ?? {
+      stock_code: normalizedCode,
+      stock_name: trade.stock_name,
+      market: trade.market,
+      quantity: 0,
+      total_cost: 0,
+      first_buy_date: '',
+      last_trade_date: trade.trade_date,
+      short_qty: 0,
+      lots: [],
+      stop_loss: undefined,
+      take_profit: undefined,
+    };
+
+    state.stock_name = trade.stock_name;
+    state.market = trade.market;
+    state.last_trade_date = trade.trade_date;
+
+    if (direction === 'BUY') {
+      let remainingBuyQty = qty;
+      const unitCost = qty > 0 ? Math.max(0, cost) / qty : 0;
+
+      // If there was oversold quantity, BUY first offsets that short debt.
+      if (state.short_qty > 0 && remainingBuyQty > 0) {
+        const coverQty = Math.min(state.short_qty, remainingBuyQty);
+        state.short_qty -= coverQty;
+        remainingBuyQty -= coverQty;
+      }
+
+      if (remainingBuyQty > 0) {
+        state.lots.push({
+          qty: remainingBuyQty,
+          cost_per_share: unitCost,
+          trade_date: trade.trade_date,
+        });
+      }
+
+      if (trade.stop_loss !== null && trade.stop_loss !== undefined) {
+        state.stop_loss = trade.stop_loss;
+      }
+      if (trade.take_profit !== null && trade.take_profit !== undefined) {
+        state.take_profit = trade.take_profit;
+      }
+    } else {
+      let remainingSellQty = qty;
+
+      // FIFO reduce open lots.
+      while (remainingSellQty > 0 && state.lots.length > 0) {
+        const firstLot = state.lots[0];
+        if (firstLot.qty <= remainingSellQty) {
+          remainingSellQty -= firstLot.qty;
+          state.lots.shift();
+        } else {
+          firstLot.qty -= remainingSellQty;
+          remainingSellQty = 0;
+        }
+      }
+
+      // If sells exceed total longs, track as short debt.
+      if (remainingSellQty > 0) {
+        state.short_qty += remainingSellQty;
+      }
+    }
+
+    state.quantity = state.lots.reduce((sum, lot) => sum + lot.qty, 0);
+    state.total_cost = state.lots.reduce((sum, lot) => sum + lot.qty * lot.cost_per_share, 0);
+    state.first_buy_date = state.lots.length > 0 ? state.lots[0].trade_date : '';
+
+    if (state.quantity <= 0) {
+      state.quantity = 0;
+      state.total_cost = 0;
+      state.first_buy_date = '';
+      state.stop_loss = undefined;
+      state.take_profit = undefined;
+    }
+
+    states.set(key, state);
   }
+
+  const now = new Date();
+  const positions = Array.from(states.values())
+    .filter(s => s.quantity > 0)
+    .map((s) => {
+      const avg_cost = s.quantity > 0 ? s.total_cost / s.quantity : 0;
+      const holding_days = s.first_buy_date
+        ? Math.max(0, Math.floor((now.getTime() - new Date(s.first_buy_date).getTime()) / (1000 * 60 * 60 * 24)))
+        : 0;
+
+      return {
+        stock_code: s.stock_code,
+        stock_name: s.stock_name,
+        market: s.market,
+        quantity: s.quantity,
+        avg_cost,
+        total_cost: s.total_cost,
+        current_price: avg_cost,
+        current_value: s.quantity * avg_cost,
+        floating_pnl: 0,
+        floating_pnl_ratio: 0,
+        first_buy_date: s.first_buy_date,
+        last_trade_date: s.last_trade_date,
+        holding_days,
+        stop_loss: s.stop_loss,
+        take_profit: s.take_profit,
+        quote_is_fallback: false,
+      } as Position;
+    })
+    .sort((a, b) => a.stock_code.localeCompare(b.stock_code));
+
+  // Debug: Log final positions
+  if (positions.length === 0) return [];
+
+  const symbols = positions.map((pos) => toQuoteSymbol(pos.stock_code, pos.market));
 
   try {
     const quotes = await getQuotes(symbols);
     const quoteMap = new Map(quotes.map(q => [q.symbol, q]));
 
     for (const pos of positions) {
-      let symbol = pos.stock_code;
-      if (pos.market === 'SH') symbol = pos.stock_code + '.SH';
-      else if (pos.market === 'SZ') symbol = pos.stock_code + '.SZ';
-      else if (pos.market === 'HK') symbol = pos.stock_code + '.HK';
-      else if (pos.market === 'US') symbol = pos.stock_code + '.US';
-
+      const symbol = toQuoteSymbol(pos.stock_code, pos.market);
       const quote = quoteMap.get(symbol);
       const currentPrice = quote ? parseFloat(quote.lastDone) : 0;
+      const hasValidQuote = Number.isFinite(currentPrice) && currentPrice > 0;
 
-      pos.current_price = currentPrice || pos.avg_cost; // 如果获取不到则用成本价
+      pos.current_price = hasValidQuote ? currentPrice : pos.avg_cost;
       pos.current_value = pos.quantity * pos.current_price;
       pos.floating_pnl = pos.current_value - pos.total_cost;
       pos.floating_pnl_ratio = pos.total_cost > 0 ? pos.floating_pnl / pos.total_cost : 0;
+      pos.quote_is_fallback = !hasValidQuote;
+      pos.quote_timestamp = toQuoteTimestamp(quote?.timestamp);
+      pos.quote_error = hasValidQuote
+        ? undefined
+        : (quote ? '行情返回无效价格，已回退到成本价' : '行情缺失，已回退到成本价');
     }
   } catch (error) {
     console.error('Failed to fetch quotes:', error);
-    // 获取失败时，使用成本价作为当前价格
+    const quoteError = error instanceof Error ? error.message : String(error);
     for (const pos of positions) {
       pos.current_price = pos.avg_cost;
       pos.current_value = pos.quantity * pos.avg_cost;
       pos.floating_pnl = 0;
       pos.floating_pnl_ratio = 0;
+      pos.quote_is_fallback = true;
+      pos.quote_error = quoteError || '行情服务异常，已回退到成本价';
+      pos.quote_timestamp = undefined;
     }
   }
 
   return positions;
+}
+
+function toQuoteSymbol(stockCode: string, market: Market): string {
+  if (market === 'SH') return `${stockCode}.SH`;
+  if (market === 'SZ') return `${stockCode}.SZ`;
+  if (market === 'HK') return `${stockCode}.HK`;
+  if (market === 'US') return `${stockCode}.US`;
+  return stockCode;
+}
+
+function toQuoteTimestamp(timestamp: Date | string | undefined): string | undefined {
+  if (!timestamp) {
+    return undefined;
+  }
+  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return undefined;
+  }
+  return date.toISOString();
 }
 
 function calculateMaxDrawdown(startDate?: string, endDate?: string): number {
@@ -330,6 +639,19 @@ function getInitialCapital(): number {
   return row ? parseFloat(row.value) : 100000;
 }
 
+function estimateCashFromTrades(initialCapital: number): number {
+  const row = queryOne(`
+    SELECT
+      COALESCE(SUM(CASE WHEN direction = 'BUY' THEN total_cost ELSE 0 END), 0) as total_buy_cost,
+      COALESCE(SUM(CASE WHEN direction = 'SELL' THEN total_cost ELSE 0 END), 0) as total_sell_amount
+    FROM trades
+  `);
+
+  const totalBuyCost = Number(row?.total_buy_cost) || 0;
+  const totalSellAmount = Number(row?.total_sell_amount) || 0;
+  return initialCapital - totalBuyCost + totalSellAmount;
+}
+
 function buildDateFilter(startDate?: string, endDate?: string): { clause: string; params: any[] } {
   const conditions: string[] = [];
   const params: any[] = [];
@@ -344,6 +666,14 @@ function buildDateFilter(startDate?: string, endDate?: string): { clause: string
   }
 
   return { clause: conditions.join(' '), params };
+}
+
+function isHistoricalRangeEnd(endDate?: string): boolean {
+  if (!endDate) {
+    return false;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  return endDate < today;
 }
 
 export function getPlanExecutionStats(startDate?: string, endDate?: string): PlanExecutionStats {
@@ -432,11 +762,12 @@ export function getPlanExecutionDetails(startDate?: string, endDate?: string): P
 }
 
 // ===== 风险评估 =====
-export function getRiskAssessment(): RiskAssessment {
+export async function getRiskAssessment(): Promise<RiskAssessment> {
   const initialCapital = getInitialCapital();
+  const fxRates = await getFxRatesWithFallback();
 
   // Get current positions with quotes
-  const positions = getCurrentPositions();
+  const positions = await getPositions();
 
   // Calculate total market value
   let totalMarketValue = 0;
@@ -444,18 +775,25 @@ export function getRiskAssessment(): RiskAssessment {
   const stockValues: { code: string; name: string; value: number }[] = [];
 
   for (const pos of positions) {
-    totalMarketValue += pos.current_value;
-    marketValues[pos.market] = (marketValues[pos.market] || 0) + pos.current_value;
+    const positionValueCny = convertMarketAmountToCny(Number(pos.current_value || 0), pos.market, fxRates);
+    totalMarketValue += positionValueCny;
+    marketValues[pos.market] = (marketValues[pos.market] || 0) + positionValueCny;
     stockValues.push({
       code: pos.stock_code,
       name: pos.stock_name,
-      value: pos.current_value,
+      value: positionValueCny,
     });
   }
 
   // Get cash from latest account snapshot
   const cashRow = queryOne('SELECT cash FROM account_snapshots ORDER BY date DESC LIMIT 1');
-  const cash = cashRow?.cash || initialCapital;
+  const estimatedCash = estimateCashFromTrades(initialCapital);
+  const snapshotCash = Number(cashRow?.cash);
+  const cash = Number.isFinite(snapshotCash)
+    ? snapshotCash
+    : Number.isFinite(estimatedCash)
+      ? estimatedCash
+      : initialCapital;
 
   const totalAssets = cash + totalMarketValue;
   const totalExposure = totalAssets > 0 ? totalMarketValue / totalAssets : 0;
@@ -492,10 +830,18 @@ export function getRiskAssessment(): RiskAssessment {
   for (const pos of positions) {
     if (pos.stop_loss && pos.stop_loss > 0) {
       positionsWithSL++;
-      const potentialDownside = (pos.avg_cost - pos.stop_loss) * pos.quantity;
-      const potentialUpside = pos.take_profit
+      const potentialDownside = convertMarketAmountToCny(
+        (pos.avg_cost - pos.stop_loss) * pos.quantity,
+        pos.market,
+        fxRates,
+      );
+      const potentialUpside = convertMarketAmountToCny(
+        pos.take_profit
         ? (pos.take_profit - pos.avg_cost) * pos.quantity
-        : (pos.current_price - pos.avg_cost) * pos.quantity * 2; // Assume 2:1 reward
+        : (pos.current_price - pos.avg_cost) * pos.quantity * 2, // Assume 2:1 reward
+        pos.market,
+        fxRates,
+      );
 
       totalPotentialDownside += Math.max(0, potentialDownside);
       totalPotentialUpside += Math.max(0, potentialUpside);
@@ -519,13 +865,18 @@ export function getRiskAssessment(): RiskAssessment {
 
   for (const pos of positions) {
     if (pos.stop_loss && pos.stop_loss > 0) {
-      const loss = (pos.avg_cost - pos.stop_loss) * pos.quantity;
+      const loss = convertMarketAmountToCny(
+        (pos.avg_cost - pos.stop_loss) * pos.quantity,
+        pos.market,
+        fxRates,
+      );
       ifAllStopLoss += Math.max(0, loss);
       largestSingleLoss = Math.max(largestSingleLoss, Math.max(0, loss));
     } else {
       // If no stop loss, assume full position value at risk
-      ifAllStopLoss += pos.current_value;
-      largestSingleLoss = Math.max(largestSingleLoss, pos.current_value);
+      const positionValueCny = convertMarketAmountToCny(Number(pos.current_value || 0), pos.market, fxRates);
+      ifAllStopLoss += positionValueCny;
+      largestSingleLoss = Math.max(largestSingleLoss, positionValueCny);
     }
   }
 
@@ -587,46 +938,6 @@ export function getRiskAssessment(): RiskAssessment {
     overall_risk_level: overallRiskLevel,
     risk_warnings: warnings,
   };
-}
-
-function getCurrentPositions(): any[] {
-  // Get all BUY positions that haven't been fully closed
-  const buyTrades = queryAll(`
-    SELECT
-      stock_code,
-      stock_name,
-      market,
-      SUM(CASE WHEN direction = 'BUY' THEN quantity ELSE -quantity END) as remaining_qty,
-      SUM(CASE WHEN direction = 'BUY' THEN total_cost ELSE -total_cost END) as total_cost
-    FROM trades
-    GROUP BY stock_code
-    HAVING remaining_qty > 0
-  `);
-
-  return buyTrades.map(t => {
-    const avgCost = t.remaining_qty > 0 ? t.total_cost / t.remaining_qty : 0;
-
-    // Get stop_loss and take_profit from most recent BUY trade
-    const slTpTrade = queryOne(`
-      SELECT stop_loss, take_profit FROM trades
-      WHERE stock_code = ? AND direction = 'BUY'
-      ORDER BY trade_date DESC LIMIT 1
-    `, [t.stock_code]);
-
-    return {
-      stock_code: t.stock_code,
-      stock_name: t.stock_name,
-      market: t.market,
-      quantity: t.remaining_qty,
-      avg_cost: avgCost,
-      total_cost: t.total_cost,
-      current_price: 0,
-      current_value: 0,
-      floating_pnl: 0,
-      stop_loss: slTpTrade?.stop_loss,
-      take_profit: slTpTrade?.take_profit,
-    };
-  });
 }
 
 // ===== 策略效果追踪 =====
