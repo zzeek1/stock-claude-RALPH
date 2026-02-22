@@ -38,6 +38,11 @@ Single document to resume work quickly in a new session and to checkpoint progre
 - `npm run test:run -- src/renderer/pages/Statistics.test.tsx` passed.
 - `npm run build` passed.
 
+## Git Sync
+- Branch: `master`
+- Latest commit: `86f6e8e`
+- Push status: pushed to `origin/master` on 2026-02-22
+
 ## Next Action
 - Manual check in app UI:
   - Compare `Positions` total holding market value vs `Statistics` risk tab total market value under same `displayCurrency` and same quote moment.
